@@ -18,8 +18,12 @@ RUN mkdir -p prompts
 # Ensure imports work: from src.config import ...
 ENV PYTHONPATH=/app
 
-# Models download at first cold start (cached by RunPod FlashBoot after)
-# Set HF_TOKEN as env var in RunPod endpoint settings
+# Use Network Volume for HuggingFace model cache (avoids disk full on container)
+# Mount volume at /runpod-volume in endpoint settings
+ENV HF_HOME=/runpod-volume/huggingface
+ENV TRANSFORMERS_CACHE=/runpod-volume/huggingface/hub
+
+# Models auto-download on first cold start, persist on Network Volume
 
 # RunPod serverless entrypoint
 CMD ["python", "-u", "src/handler.py"]

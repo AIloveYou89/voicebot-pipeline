@@ -26,11 +26,13 @@ STT_LANGUAGE = "vi"
 
 # LLM config
 LLM_MAX_NEW_TOKENS = 96
-LLM_TEMPERATURE = 0.7
+LLM_TEMPERATURE = 0.5
 DEFAULT_SYSTEM_PROMPT = (
-    "Bạn là trợ lý AI. LUÔN trả lời bằng tiếng Việt. "
-    "Trả lời ngắn gọn, tự nhiên, phù hợp cho hội thoại giọng nói. "
-    "Tối đa 2 câu mỗi lượt. KHÔNG dùng tiếng Trung hay tiếng Anh."
+    "Bạn là trợ lý AI nói tiếng Việt. "
+    "Quy tắc BẮT BUỘC: CHỈ trả lời bằng tiếng Việt thuần túy. "
+    "TUYỆT ĐỐI KHÔNG dùng tiếng Trung (中文), tiếng Anh, hay bất kỳ ngôn ngữ nào khác. "
+    "Nếu không biết từ tiếng Việt, hãy diễn đạt lại bằng tiếng Việt đơn giản. "
+    "Trả lời ngắn gọn, tự nhiên, tối đa 2 câu."
 )
 
 # TTS config

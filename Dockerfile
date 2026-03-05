@@ -15,6 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ src/
 RUN mkdir -p prompts
 
+# Ensure imports work: from src.config import ...
+ENV PYTHONPATH=/app
+
 # Models download at first cold start (cached by RunPod FlashBoot after)
 # Set HF_TOKEN as env var in RunPod endpoint settings
 

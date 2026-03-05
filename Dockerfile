@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source
 COPY src/ src/
-COPY prompts/ prompts/
+RUN mkdir -p prompts
 
 # Models download at first cold start (cached by RunPod FlashBoot after)
 # Set HF_TOKEN as env var in RunPod endpoint settings

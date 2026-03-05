@@ -10,6 +10,14 @@ autoawq==0.2.7
 soundfile==0.13.1
 numpy==1.26.4
 soxr==0.5.0
+scipy
+librosa
+
+# SparkTTS dependencies
+accelerate>=0.33
+einops>=0.8.1
+einx>=0.3.0
+safetensors>=0.5.2
 
 # Text preprocessing
 num2words==0.5.14

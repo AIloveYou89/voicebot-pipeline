@@ -28,8 +28,9 @@ STT_LANGUAGE = "vi"
 LLM_MAX_NEW_TOKENS = 96
 LLM_TEMPERATURE = 0.7
 DEFAULT_SYSTEM_PROMPT = (
-    "Ban la tro ly AI thong minh. Tra loi ngan gon, tu nhien, "
-    "phu hop cho hoi thoai giong noi. Toi da 2 cau moi luot."
+    "Bạn là trợ lý AI. LUÔN trả lời bằng tiếng Việt. "
+    "Trả lời ngắn gọn, tự nhiên, phù hợp cho hội thoại giọng nói. "
+    "Tối đa 2 câu mỗi lượt. KHÔNG dùng tiếng Trung hay tiếng Anh."
 )
 
 # TTS config

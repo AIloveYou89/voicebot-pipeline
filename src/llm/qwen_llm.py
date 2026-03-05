@@ -1,8 +1,10 @@
 """LLM module — Qwen2.5-7B-Instruct-AWQ inference on GPU."""
 import time
+import threading
+from typing import Generator
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
 from src.config import (
     logger, DEVICE, HF_TOKEN,
@@ -40,6 +42,23 @@ def load_model():
     logger.info(f"[LLM] Loaded in {time.time() - t0:.1f}s")
 
 
+def _prepare_inputs(
+    messages: list[dict],
+    system_prompt: str | None = None,
+):
+    """Prepare tokenized inputs from messages."""
+    load_model()
+    sys_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
+    full_messages = [{"role": "system", "content": sys_prompt}] + messages
+
+    text = _tokenizer.apply_chat_template(
+        full_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return _tokenizer(text, return_tensors="pt").to(DEVICE)
+
+
 def generate(
     messages: list[dict],
     system_prompt: str | None = None,
@@ -49,32 +68,12 @@ def generate(
     """
     Generate a full response (no streaming) for Phase 1.
 
-    Args:
-        messages: List of {"role": "user"|"assistant", "content": "..."}.
-        system_prompt: Override default system prompt.
-        max_new_tokens: Override default max tokens.
-        temperature: Override default temperature.
-
     Returns:
         (response_text, latency_seconds)
     """
-    load_model()
-
-    sys_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
+    inputs = _prepare_inputs(messages, system_prompt)
     max_tokens = max_new_tokens or LLM_MAX_NEW_TOKENS
     temp = temperature or LLM_TEMPERATURE
-
-    # Build chat messages with system prompt
-    full_messages = [{"role": "system", "content": sys_prompt}] + messages
-
-    # Apply chat template
-    text = _tokenizer.apply_chat_template(
-        full_messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    inputs = _tokenizer(text, return_tensors="pt").to(DEVICE)
 
     t0 = time.time()
     with torch.no_grad():
@@ -89,9 +88,57 @@ def generate(
         )
     latency = time.time() - t0
 
-    # Decode only new tokens
     new_tokens = output_ids[0][inputs["input_ids"].shape[-1]:]
     response = _tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
     logger.info(f"[LLM] '{response[:80]}...' ({latency:.2f}s, {len(new_tokens)} tokens)")
     return response, latency
+
+
+def generate_stream(
+    messages: list[dict],
+    system_prompt: str | None = None,
+    max_new_tokens: int | None = None,
+    temperature: float | None = None,
+) -> Generator[str, None, None]:
+    """
+    Stream tokens as they are generated (Phase 2).
+
+    Yields token strings one at a time. LLM runs on a background thread,
+    tokens are yielded on the calling thread via TextIteratorStreamer.
+    """
+    inputs = _prepare_inputs(messages, system_prompt)
+    max_tokens = max_new_tokens or LLM_MAX_NEW_TOKENS
+    temp = temperature or LLM_TEMPERATURE
+
+    streamer = TextIteratorStreamer(
+        _tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=True,
+    )
+
+    gen_kwargs = {
+        **inputs,
+        "streamer": streamer,
+        "max_new_tokens": max_tokens,
+        "temperature": temp,
+        "top_p": 0.8,
+        "top_k": 50,
+        "do_sample": True,
+        "repetition_penalty": 1.1,
+    }
+
+    # Run generate() on background thread — tokens flow via streamer
+    thread = threading.Thread(
+        target=lambda: _model.generate(**gen_kwargs),
+        daemon=True,
+    )
+    thread.start()
+
+    logger.info("[LLM] Streaming started...")
+    for token_text in streamer:
+        if token_text:
+            yield token_text
+
+    thread.join()
+    logger.info("[LLM] Streaming complete")

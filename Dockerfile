@@ -15,16 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ src/
 COPY prompts/ prompts/
 
-# Pre-download models at build time (baked into image → no cold start)
-ARG HF_TOKEN
-ENV HF_TOKEN=${HF_TOKEN}
-
-RUN python -c "\
-from huggingface_hub import snapshot_download; \
-snapshot_download('openai/whisper-large-v3', token='${HF_TOKEN}'); \
-snapshot_download('Qwen/Qwen2.5-7B-Instruct-AWQ', token='${HF_TOKEN}'); \
-snapshot_download('DragonLineageAI/Vi-SparkTTS-0.5B', token='${HF_TOKEN}'); \
-"
+# Models download at first cold start (cached by RunPod FlashBoot after)
+# Set HF_TOKEN as env var in RunPod endpoint settings
 
 # RunPod serverless entrypoint
 CMD ["python", "-u", "src/handler.py"]

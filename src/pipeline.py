@@ -22,7 +22,7 @@ from src.tts.spark_tts import synthesize
 # Phrase splitting patterns
 _SENTENCE_END = re.compile(r'[.?!。？！…]\s*')
 _PHRASE_BREAK = re.compile(r'[,;:，；]\s*')
-_MAX_PHRASE_WORDS = 12
+_MAX_PHRASE_WORDS = 20
 
 
 def _audio_to_b64(audio_np: np.ndarray, sample_rate: int) -> str:
@@ -253,9 +253,9 @@ def process_turn_streaming(
         }
         return
 
-    # Flush remaining buffer
+    # Flush remaining buffer (skip if too short — not worth a TTS call)
     remaining = buffer.strip()
-    if remaining:
+    if remaining and len(remaining.split()) >= 2:
         phrase_num += 1
         if phrase_num == 1:
             timings["llm_first_phrase"] = round(time.time() - llm_start, 3)
@@ -275,6 +275,9 @@ def process_turn_streaming(
             }
         except Exception as e:
             logger.error(f"[STREAM] TTS failed final phrase: {e}")
+    elif remaining:
+        logger.info(f"[STREAM] Skipping tiny flush: '{remaining}' (< 2 words)")
+        full_response = full_response  # keep in full_response for done message
 
     timings["tts_total"] = round(tts_total, 3)
     timings["total"] = round(time.time() - total_start, 3)

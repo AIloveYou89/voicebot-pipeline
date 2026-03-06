@@ -20,21 +20,32 @@ _load_start = time.time()
 
 from src.config import TTS_ENGINE
 
-from src.stt.whisper_stt import load_model as load_stt
-from src.llm.qwen_llm import load_model as load_llm
+try:
+    from src.stt.whisper_stt import load_model as load_stt
+    from src.llm.qwen_llm import load_model as load_llm
 
-if TTS_ENGINE == "vieneu":
-    from src.tts.vieneu_tts import load_model as load_tts
-    logger.info("[HANDLER] Using VieNeu-TTS engine")
-else:
-    from src.tts.spark_tts import load_model as load_tts
-    logger.info("[HANDLER] Using SparkTTS engine")
+    if TTS_ENGINE == "vieneu":
+        from src.tts.vieneu_tts import load_model as load_tts
+        logger.info("[HANDLER] Using VieNeu-TTS engine")
+    else:
+        from src.tts.spark_tts import load_model as load_tts
+        logger.info("[HANDLER] Using SparkTTS engine")
 
-load_stt()
-load_llm()
-load_tts()
+    load_stt()
+    load_llm()
+    load_tts()
 
-logger.info(f"[HANDLER] All models loaded in {time.time() - _load_start:.1f}s")
+    logger.info(f"[HANDLER] All models loaded in {time.time() - _load_start:.1f}s")
+except Exception as e:
+    import traceback
+    logger.error(f"[HANDLER] FATAL: Model loading failed: {e}")
+    logger.error(traceback.format_exc())
+    import sys
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Give RunPod time to capture logs before exit
+    time.sleep(2)
+    raise
 
 
 def _validate_input(job: dict) -> tuple[bytes | None, list, str | None, bool, dict | None]:

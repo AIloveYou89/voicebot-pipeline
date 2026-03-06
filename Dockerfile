@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Cache bust: v5-torch26
+# Cache bust: v6-torchvision
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -29,6 +29,12 @@ ENV HF_HOME=/runpod-volume/huggingface
 ENV TRANSFORMERS_CACHE=/runpod-volume/huggingface/hub
 
 # Models auto-download on first cold start, persist on Network Volume
+
+# Verify imports work at build time (catch errors early)
+RUN python -c "import torch; print(f'torch {torch.__version__} CUDA={torch.cuda.is_available()}')" && \
+    python -c "import transformers; print(f'transformers {transformers.__version__}')" && \
+    python -c "import vieneu; print(f'vieneu OK')" && \
+    python -c "from src.config import TTS_ENGINE; print(f'TTS_ENGINE={TTS_ENGINE}')"
 
 # RunPod serverless entrypoint
 CMD ["python", "-u", "src/handler.py"]

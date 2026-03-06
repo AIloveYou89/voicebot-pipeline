@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
 
 # System deps for soundfile (libsndfile)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Cache bust: v6-torchvision
+# Cache bust: v7-cuda124
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

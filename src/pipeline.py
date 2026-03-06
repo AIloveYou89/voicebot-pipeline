@@ -13,10 +13,14 @@ from typing import Generator
 import numpy as np
 import soundfile as sf
 
-from src.config import logger
+from src.config import logger, TTS_ENGINE
 from src.stt.whisper_stt import transcribe
 from src.llm.qwen_llm import generate, generate_stream
-from src.tts.spark_tts import synthesize
+
+if TTS_ENGINE == "vieneu":
+    from src.tts.vieneu_tts import synthesize
+else:
+    from src.tts.spark_tts import synthesize
 
 
 # Phrase splitting patterns

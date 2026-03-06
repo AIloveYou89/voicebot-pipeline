@@ -16,6 +16,7 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "openai/whisper-large-v3")
 QWEN_MODEL = os.getenv("QWEN_MODEL", "Qwen/Qwen2.5-7B-Instruct-AWQ")
 TTS_MODEL = os.getenv("TTS_MODEL", "DragonLineageAI/Vi-SparkTTS-0.5B")
+TTS_ENGINE = os.getenv("TTS_ENGINE", "vieneu")  # "vieneu" or "spark"
 
 # Device
 DEVICE = "cuda"

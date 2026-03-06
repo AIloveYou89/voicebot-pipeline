@@ -88,6 +88,10 @@ def chat():
         return jsonify({"error": f"Submit failed: {e}"}), 500
 
     # Poll for results (max 120s for cold start)
+    # IMPORTANT: Collect ALL chunks across multiple polls.
+    # RunPod streaming returns chunks incrementally — first poll may only
+    # have the transcript; audio_chunk and done come in later polls.
+    all_chunks = []
     start = time.time()
     while time.time() - start < 120:
         try:
@@ -95,24 +99,37 @@ def chat():
             resp.raise_for_status()
             result = resp.json()
 
+            # Collect new chunks from this poll
             if result.get("stream"):
-                # Extract chunks
-                chunks = []
                 for chunk in result["stream"]:
                     output = chunk.get("output", chunk)
                     if isinstance(output, dict):
-                        chunks.append(output)
-                return jsonify({"status": "ok", "chunks": chunks})
+                        all_chunks.append(output)
 
             status = result.get("status", "UNKNOWN")
+
+            # Check if we got the "done" chunk (generator finished)
+            has_done = any(c.get("type") == "done" for c in all_chunks)
+            has_error = any(c.get("type") == "error" for c in all_chunks)
+
+            if has_done or has_error:
+                return jsonify({"status": "ok", "chunks": all_chunks})
+
             if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
                 return jsonify({"error": f"Job {status}"}), 500
+
+            # Stream finished but no done chunk — all data received
+            if status == "COMPLETED" and all_chunks:
+                return jsonify({"status": "ok", "chunks": all_chunks})
 
         except Exception as e:
             pass
 
         time.sleep(0.5)
 
+    # Timeout but return whatever we collected
+    if all_chunks:
+        return jsonify({"status": "ok", "chunks": all_chunks})
     return jsonify({"error": "Timeout"}), 504
 
 
@@ -334,7 +351,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 <div class="container">
   <h1>VoiceBot</h1>
-  <p class="subtitle">Nhấn nút mic rồi nói chuyện</p>
+  <p class="subtitle">Nhấn mic để ghi âm — nhấn lại để gửi</p>
 
   <div class="mic-area">
     <button class="mic-btn idle" id="micBtn" onclick="toggleVoiceChat()">
@@ -575,18 +592,30 @@ async function processRecording() {
 }
 
 function playAudioB64(b64) {
-  return new Promise((resolve) => {
-    const binary = atob(b64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Promise(async (resolve) => {
+    try {
+      // Resume AudioContext if suspended (browser autoplay policy)
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+      }
 
-    audioContext.decodeAudioData(bytes.buffer.slice(0), (buffer) => {
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+      // Use promise-based decodeAudioData
+      const buffer = await audioContext.decodeAudioData(bytes.buffer.slice(0));
+      console.log('Audio decoded: duration=' + buffer.duration.toFixed(2) + 's, sr=' + buffer.sampleRate);
+
       const source = audioContext.createBufferSource();
       source.buffer = buffer;
       source.connect(audioContext.destination);
       source.onended = resolve;
       source.start();
-    }, () => resolve());
+    } catch(e) {
+      console.error('playAudioB64 failed:', e);
+      resolve(); // Don't block the chain
+    }
   });
 }
 

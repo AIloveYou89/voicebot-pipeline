@@ -18,9 +18,17 @@ from src.pipeline import process_turn, process_turn_streaming
 logger.info("[HANDLER] Pre-loading models...")
 _load_start = time.time()
 
+from src.config import TTS_ENGINE
+
 from src.stt.whisper_stt import load_model as load_stt
 from src.llm.qwen_llm import load_model as load_llm
-from src.tts.spark_tts import load_model as load_tts
+
+if TTS_ENGINE == "vieneu":
+    from src.tts.vieneu_tts import load_model as load_tts
+    logger.info("[HANDLER] Using VieNeu-TTS engine")
+else:
+    from src.tts.spark_tts import load_model as load_tts
+    logger.info("[HANDLER] Using SparkTTS engine")
 
 load_stt()
 load_llm()

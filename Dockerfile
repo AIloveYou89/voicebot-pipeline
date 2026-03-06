@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python deps
+# Cache bust: v3-vieneu
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

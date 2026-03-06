@@ -14,7 +14,7 @@ scipy
 librosa
 
 # SparkTTS dependencies (kept for fallback)
-accelerate>=1.0.0
+accelerate>=1.2.0
 einops>=0.8.1
 einx>=0.3.0
 safetensors>=0.5.2

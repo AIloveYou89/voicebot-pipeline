@@ -79,8 +79,8 @@ def _is_hallucination(text: str) -> bool:
     """Detect Whisper hallucination — fake YouTube-style phrases from noise."""
     text_lower = text.lower()
     match_count = sum(1 for p in _HALLUCINATION_PATTERNS if p in text_lower)
-    # If 2+ hallucination phrases found, likely fake
-    return match_count >= 2
+    # If 3+ hallucination phrases found, very likely fake
+    return match_count >= 3
 
 
 def transcribe(audio_bytes: bytes) -> tuple[str, float]:
@@ -98,11 +98,12 @@ def transcribe(audio_bytes: bytes) -> tuple[str, float]:
     t0 = time.time()
     audio_np = _ensure_16khz(audio_bytes)
 
-    # Check if audio is mostly silence (RMS energy)
+    # Check if audio is mostly silence (very low threshold — only pure silence)
     rms = float(np.sqrt(np.mean(audio_np ** 2)))
-    if rms < 0.005:
+    logger.info(f"[STT] Audio RMS={rms:.4f}, duration={len(audio_np)/STT_SAMPLE_RATE:.1f}s")
+    if rms < 0.001:
         latency = time.time() - t0
-        logger.info(f"[STT] Silence detected (RMS={rms:.4f}), skipping ({latency:.2f}s)")
+        logger.info(f"[STT] Pure silence (RMS={rms:.4f}), skipping ({latency:.2f}s)")
         return "", latency
 
     result = _pipe(
@@ -113,7 +114,7 @@ def transcribe(audio_bytes: bytes) -> tuple[str, float]:
 
     text = result.get("text", "").strip()
 
-    # Filter Whisper hallucinations
+    # Filter Whisper hallucinations (only if 3+ patterns match — very confident)
     if _is_hallucination(text):
         logger.warning(f"[STT] Hallucination filtered: '{text[:80]}' ({latency:.2f}s)")
         return "", latency

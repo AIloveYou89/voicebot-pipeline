@@ -592,8 +592,25 @@ function playAudioB64(b64) {
 
 function audioBufferToWavB64(buffer) {
   const numChannels = 1;
-  const sampleRate = buffer.sampleRate;
-  const samples = buffer.getChannelData(0);
+  const sourceSR = buffer.sampleRate;
+  const targetSR = 16000;
+  const sourceData = buffer.getChannelData(0);
+
+  // Resample to 16kHz if needed (browser often gives 48kHz)
+  let samples;
+  if (sourceSR !== targetSR) {
+    const ratio = sourceSR / targetSR;
+    const newLen = Math.floor(sourceData.length / ratio);
+    samples = new Float32Array(newLen);
+    for (let i = 0; i < newLen; i++) {
+      samples[i] = sourceData[Math.floor(i * ratio)];
+    }
+    console.log('Resampled:', sourceSR, '->', targetSR, 'samples:', sourceData.length, '->', newLen);
+  } else {
+    samples = sourceData;
+  }
+
+  const sampleRate = targetSR;
   const int16 = new Int16Array(samples.length);
   for (let i = 0; i < samples.length; i++) {
     int16[i] = Math.max(-32768, Math.min(32767, Math.round(samples[i] * 32767)));

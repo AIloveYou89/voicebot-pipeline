@@ -10,7 +10,7 @@ autoawq==0.2.7
 soundfile==0.13.1
 numpy==1.26.4
 soxr==0.5.0
-scipy
+scipy==1.14.1
 librosa
 
 # SparkTTS dependencies (kept for fallback)

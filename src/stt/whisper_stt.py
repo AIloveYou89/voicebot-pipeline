@@ -66,6 +66,23 @@ def _ensure_16khz(audio_bytes: bytes) -> np.ndarray:
     return waveform.squeeze().numpy()
 
 
+# Known Whisper hallucination patterns (Vietnamese)
+_HALLUCINATION_PATTERNS = [
+    "subscribe", "kênh", "theo dõi", "đăng ký", "đăng kí",
+    "bỏ lỡ", "video hấp dẫn", "hẹn gặp lại", "lalaschool",
+    "ghiền mì gõ", "like và share", "bấm chuông",
+    "cảm ơn các bạn đã theo dõi", "mọi người", "em là",
+]
+
+
+def _is_hallucination(text: str) -> bool:
+    """Detect Whisper hallucination — fake YouTube-style phrases from noise."""
+    text_lower = text.lower()
+    match_count = sum(1 for p in _HALLUCINATION_PATTERNS if p in text_lower)
+    # If 2+ hallucination phrases found, likely fake
+    return match_count >= 2
+
+
 def transcribe(audio_bytes: bytes) -> tuple[str, float]:
     """
     Transcribe audio bytes to Vietnamese text.
@@ -80,6 +97,14 @@ def transcribe(audio_bytes: bytes) -> tuple[str, float]:
 
     t0 = time.time()
     audio_np = _ensure_16khz(audio_bytes)
+
+    # Check if audio is mostly silence (RMS energy)
+    rms = float(np.sqrt(np.mean(audio_np ** 2)))
+    if rms < 0.005:
+        latency = time.time() - t0
+        logger.info(f"[STT] Silence detected (RMS={rms:.4f}), skipping ({latency:.2f}s)")
+        return "", latency
+
     result = _pipe(
         {"raw": audio_np, "sampling_rate": STT_SAMPLE_RATE},
         return_timestamps=False,
@@ -87,5 +112,11 @@ def transcribe(audio_bytes: bytes) -> tuple[str, float]:
     latency = time.time() - t0
 
     text = result.get("text", "").strip()
+
+    # Filter Whisper hallucinations
+    if _is_hallucination(text):
+        logger.warning(f"[STT] Hallucination filtered: '{text[:80]}' ({latency:.2f}s)")
+        return "", latency
+
     logger.info(f"[STT] '{text[:80]}...' ({latency:.2f}s)")
     return text, latency

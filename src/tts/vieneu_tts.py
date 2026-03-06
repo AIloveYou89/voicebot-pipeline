@@ -1,23 +1,47 @@
-"""TTS module — VieNeu-TTS inference on GPU.
+"""TTS module — VieNeu-TTS inference on GPU with voice cloning.
 
 Drop-in replacement for spark_tts.py with same interface:
     load_model(), synthesize(text) -> (audio_np, sample_rate, latency)
 """
+import os
 import time
 
 import numpy as np
+import soundfile as sf
 import torchaudio
 import torch
 
-from src.config import logger, TTS_TARGET_SR
+from src.config import (
+    logger, TTS_TARGET_SR, TTS_PROMPT_TRANSCRIPT,
+    PROMPT_AUDIO_PATHS,
+)
 from src.tts.preprocess import normalize_text_vn
 
 _tts = None
+_ref_audio_path = None
+
+
+def _find_ref_audio() -> str | None:
+    """Find voice cloning reference audio file."""
+    for path in PROMPT_AUDIO_PATHS:
+        if os.path.exists(path):
+            try:
+                audio_data, sr = sf.read(path)
+                if len(audio_data) == 0:
+                    continue
+                duration = len(audio_data) / sr
+                if duration < 1.0:
+                    continue
+                logger.info(f"[TTS] Reference audio found: {path} ({duration:.1f}s)")
+                return path
+            except Exception as e:
+                logger.warning(f"[TTS] Bad ref audio {path}: {e}")
+    return None
 
 
 def load_model():
     """Load VieNeu-TTS model."""
-    global _tts
+    global _tts, _ref_audio_path
     if _tts is not None:
         return
 
@@ -26,6 +50,13 @@ def load_model():
 
     from vieneu import Vieneu
     _tts = Vieneu()
+
+    # Find reference audio for voice cloning
+    _ref_audio_path = _find_ref_audio()
+    if _ref_audio_path:
+        logger.info(f"[TTS] Voice cloning enabled with: {_ref_audio_path}")
+    else:
+        logger.warning("[TTS] No reference audio found — using default voice")
 
     logger.info(f"[TTS] VieNeu loaded in {time.time() - t0:.1f}s")
 
@@ -37,7 +68,11 @@ def _warmup():
     """Run a short inference to warm up the model."""
     logger.info("[TTS] Warming up...")
     try:
-        _ = _tts.infer(text="Xin chào.")
+        infer_args = {"text": "Xin chào."}
+        if _ref_audio_path:
+            infer_args["ref_audio"] = _ref_audio_path
+            infer_args["ref_text"] = TTS_PROMPT_TRANSCRIPT
+        _ = _tts.infer(**infer_args)
         logger.info("[TTS] Warmup done")
     except Exception as e:
         logger.warning(f"[TTS] Warmup failed (non-critical): {e}")
@@ -45,7 +80,7 @@ def _warmup():
 
 def synthesize(text: str) -> tuple[np.ndarray, int, float]:
     """
-    Synthesize speech from text.
+    Synthesize speech from text with voice cloning.
 
     Args:
         text: Input text (will be preprocessed/normalized).
@@ -55,7 +90,7 @@ def synthesize(text: str) -> tuple[np.ndarray, int, float]:
     """
     load_model()
 
-    # Preprocess Vietnamese text (reuse existing normalizer, skip SparkTTS-specific leading dot)
+    # Preprocess Vietnamese text
     processed_text = normalize_text_vn(text)
     if not processed_text:
         processed_text = text.strip()
@@ -63,8 +98,13 @@ def synthesize(text: str) -> tuple[np.ndarray, int, float]:
     logger.info(f"[TTS] Synthesizing: '{processed_text[:60]}...'")
     t0 = time.time()
 
-    # VieNeu returns audio dict with 'audio' and 'sampling_rate'
-    result = _tts.infer(text=processed_text)
+    # Build inference args — with voice cloning if ref audio available
+    infer_args = {"text": processed_text}
+    if _ref_audio_path:
+        infer_args["ref_audio"] = _ref_audio_path
+        infer_args["ref_text"] = TTS_PROMPT_TRANSCRIPT
+
+    result = _tts.infer(**infer_args)
 
     # Extract audio - VieNeu returns numpy array or dict
     if isinstance(result, dict):

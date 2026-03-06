@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Cache bust: v7-cuda124
+# Cache bust: v8-voiceclone
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

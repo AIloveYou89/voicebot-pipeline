@@ -21,6 +21,8 @@ safetensors>=0.5.2
 
 # VieNeu-TTS (default engine)
 vieneu
+phonemizer>=3.3.0
+neucodec>=0.0.4
 
 # Text preprocessing
 num2words==0.5.14

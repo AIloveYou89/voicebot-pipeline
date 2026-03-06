@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
 
 # System deps for soundfile (libsndfile)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -11,6 +11,10 @@ WORKDIR /app
 # Install Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# llama-cpp-python with CUDA support (VieNeu-TTS fast mode)
+ENV CMAKE_ARGS="-DGGML_CUDA=on"
+RUN pip install --no-cache-dir llama-cpp-python==0.3.16
 
 # Copy source
 COPY src/ src/

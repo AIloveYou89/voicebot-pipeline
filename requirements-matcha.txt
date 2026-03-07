@@ -1,0 +1,6 @@
+git+https://github.com/phineas-pta/MatchaTTS_ngngngan.git
+flask
+flask-cors
+huggingface_hub
+soundfile
+numpy

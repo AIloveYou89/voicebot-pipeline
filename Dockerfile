@@ -1,40 +1,49 @@
-FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
+# ============================================================
+# Voicebot All-in-One — Docker Image
+# Pre-bakes: OS deps, pip packages, model weights
+# Runtime: load models vào GPU (~30s thay vì ~5min download+load)
+#
+# Image: ghcr.io/ailoveyou89/voicebot-pipeline:latest
+# ============================================================
 
-# System deps for soundfile (libsndfile)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsndfile1 ffmpeg git build-essential \
-    espeak-ng gfortran cmake \
-    && rm -rf /var/lib/apt/lists/*
+FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
 
 WORKDIR /app
 
-# Cache bust: v8-voiceclone
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# --- OS deps ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsndfile1 ffmpeg espeak-ng git \
+    && rm -rf /var/lib/apt/lists/*
 
-# llama-cpp-python with CUDA support (VieNeu-TTS fast mode)
-ENV CMAKE_ARGS="-DGGML_CUDA=on"
-RUN pip install --no-cache-dir llama-cpp-python==0.3.16
+# --- Python deps (cached layer) ---
+COPY constraints.txt .
+RUN pip install --no-cache-dir \
+    -c constraints.txt \
+    "numpy>=2.0,<3" setuptools wheel packaging \
+    flask flask-cors flask-sock faster-whisper soundfile \
+    huggingface_hub openai scipy \
+    styletts2 phonemizer
 
-# Copy source
-COPY src/ src/
-RUN mkdir -p prompts
+# --- Download models into image ---
+# STT: Faster-Whisper large-v3 (~3GB)
+RUN python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', device='cpu', compute_type='int8')"
 
-# Ensure imports work: from src.config import ...
-ENV PYTHONPATH=/app
+# LLM: Qwen2.5-7B-Instruct (~15GB)
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-7B-Instruct')"
 
-# Use Network Volume for HuggingFace model cache (avoids disk full on container)
-# Mount volume at /runpod-volume in endpoint settings
-ENV HF_HOME=/runpod-volume/huggingface
-ENV TRANSFORMERS_CACHE=/runpod-volume/huggingface/hub
+# TTS: StyleTTS2-lite-vi (~200MB)
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('dangtr0408/StyleTTS2-lite-vi', local_dir='/app/styletts2_lite_vi')"
 
-# Models auto-download on first cold start, persist on Network Volume
+# --- Copy app code (small layer — fast rebuild on code changes) ---
+COPY all_in_one_server.py handlers.py start.sh ./
 
-# Verify imports work at build time (catch errors early)
-RUN python -c "import torch; print(f'torch {torch.__version__} CUDA={torch.cuda.is_available()}')" && \
-    python -c "import transformers; print(f'transformers {transformers.__version__}')" && \
-    python -c "import vieneu; print(f'vieneu OK')" && \
-    python -c "from src.config import TTS_ENGINE; print(f'TTS_ENGINE={TTS_ENGINE}')"
+# --- Env defaults ---
+ENV PORT=5300 \
+    LLM_MODE=local \
+    LLM_MODEL=Qwen/Qwen2.5-7B-Instruct \
+    STYLETTS2_MODEL_DIR=/app/styletts2_lite_vi \
+    ENABLE_DEEPFILTER=0
 
-# RunPod serverless entrypoint
-CMD ["python", "-u", "src/handler.py"]
+EXPOSE 5300
+
+CMD ["python", "-u", "all_in_one_server.py"]

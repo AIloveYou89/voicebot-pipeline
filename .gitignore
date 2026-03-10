@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# IDE
+.ipynb_checkpoints/
+
+# Logs & runtime
+*.log
+*.jsonl
+server_restart*.log
+
+# Claude Code
+.claude/
+
+# Models (too large for git — baked into Docker image)
+styletts2_lite_vi/
+*.pth
+*.pt
+*.safetensors
+*.ckpt
+
+# Audio test files
+*.wav
+!prompts/consent_audio.wav
+
+# Env
+.env

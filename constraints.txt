@@ -1,0 +1,8 @@
+# Pin numpy 2.x — StyleTTS2 + faster-whisper need consistent ABI
+numpy>=2.0,<3
+# scipy must be 1.13+ to support numpy 2.x
+scipy>=1.13,<2
+# Build deps
+setuptools>=68
+wheel
+packaging

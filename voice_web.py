@@ -1,344 +1,38 @@
 """
-Voice Chat Web UI — Deepgram Streaming STT → OpenAI LLM → SparkTTS on Pod
-
-Optimized: Deepgram WebSocket streaming (real-time STT while speaking)
+Voice Chat Web UI — WebSocket + Binary Audio
+  Browser connects directly to RunPod server via WebSocket
+  Binary WAV audio (no base64), streaming TTS playback
+  Falls back to HTTP POST if WebSocket unavailable
 
 Usage:
-    python3 voice_web.py
+    POD_URL=https://{pod_id}-5300.proxy.runpod.net python3 voice_web.py
     Open http://localhost:5050
 """
 import os
-import io
-import json
-import base64
-import time
-import wave
-import asyncio
-import threading
+import sys
 
-import numpy as np
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from flask_sock import Sock
-import requests as http_requests
-import websockets
-from openai import OpenAI
+from flask import Flask
 
 # ============================================================
 # Config
 # ============================================================
 
-def load_env():
-    env = {}
-    env_file = os.path.expanduser("~/.env.agentic")
-    if os.path.exists(env_file):
-        with open(env_file) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, val = line.split("=", 1)
-                    env[key.strip()] = val.strip()
-    return env
-
-env = load_env()
-
-DEEPGRAM_API_KEY = env.get("DEEPGRAM_API_KEY", "")
-OPENAI_API_KEY = env.get("OPENAI_API_KEY", "")
-TTS_URL = "https://xlw73o6a65o6hz-7860.proxy.runpod.net/tts/b64"
-
-SYSTEM_PROMPT = (
-    "Bạn là trợ lý AI nói tiếng Việt. "
-    "Trả lời ngắn gọn, tự nhiên, tối đa 2 câu. "
-    "CHỈ trả lời bằng tiếng Việt."
-)
-
-DEEPGRAM_WS_URL = (
-    "wss://api.deepgram.com/v1/listen"
-    "?model=nova-2&language=vi&encoding=linear16&sample_rate=16000&channels=1"
-    "&punctuate=true&interim_results=true&vad_events=true&endpointing=300"
-)
+POD_URL = os.environ.get("POD_URL", "https://s7p762hm9q1eq8-5300.proxy.runpod.net")
+WS_URL = POD_URL.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
 
 app = Flask(__name__)
-CORS(app)
-sock = Sock(app)
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-http_session = http_requests.Session()  # Connection pooling
+sys.stdout.reconfigure(line_buffering=True)
 
 # ============================================================
-# Streaming STT via WebSocket
-# ============================================================
-
-async def deepgram_stream_stt(audio_chunks_queue, result_holder):
-    """Stream audio to Deepgram WebSocket, get real-time transcript."""
-    extra_headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
-
-    try:
-        async with websockets.connect(DEEPGRAM_WS_URL, extra_headers=extra_headers) as ws:
-            final_transcript = ""
-
-            async def send_audio():
-                while True:
-                    chunk = await audio_chunks_queue.get()
-                    if chunk is None:  # End signal
-                        await ws.send(json.dumps({"type": "CloseStream"}))
-                        break
-                    await ws.send(chunk)
-
-            async def recv_results():
-                nonlocal final_transcript
-                async for msg in ws:
-                    data = json.loads(msg)
-                    if data.get("type") == "Results":
-                        is_final = data.get("is_final", False)
-                        transcript = data["channel"]["alternatives"][0]["transcript"]
-                        if is_final and transcript.strip():
-                            final_transcript += " " + transcript
-                        # Send interim results back
-                        result_holder["interim"] = (final_transcript.strip() + " " + transcript).strip() if not is_final else final_transcript.strip()
-                        if is_final:
-                            result_holder["interim"] = final_transcript.strip()
-
-            send_task = asyncio.create_task(send_audio())
-            recv_task = asyncio.create_task(recv_results())
-
-            await send_task
-            # Wait a bit for final results after closing
-            try:
-                await asyncio.wait_for(recv_task, timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-
-            result_holder["final"] = final_transcript.strip()
-    except Exception as e:
-        result_holder["error"] = str(e)
-
-
-def run_deepgram_stream(audio_chunks, result_holder):
-    """Run async Deepgram streaming in a new event loop."""
-    loop = asyncio.new_event_loop()
-    queue = asyncio.Queue()
-
-    async def main():
-        # Put all chunks into queue
-        q_task = asyncio.create_task(put_chunks(queue, audio_chunks))
-        stt_task = asyncio.create_task(deepgram_stream_stt(queue, result_holder))
-        await asyncio.gather(q_task, stt_task)
-
-    async def put_chunks(q, chunks_list):
-        for chunk in chunks_list:
-            await q.put(chunk)
-        await q.put(None)  # End signal
-
-    loop.run_until_complete(main())
-    loop.close()
-
-
-# ============================================================
-# WebSocket endpoint for real-time voice chat
-# ============================================================
-
-@sock.route("/ws/voice")
-def voice_ws(ws):
-    """WebSocket endpoint: browser streams audio → real-time STT → LLM → TTS."""
-    audio_chunks = []
-    conversation = []
-
-    while True:
-        try:
-            msg = ws.receive(timeout=30)
-        except Exception:
-            break
-
-        if msg is None:
-            break
-
-        # Handle text messages (JSON commands)
-        if isinstance(msg, str):
-            try:
-                data = json.loads(msg)
-            except json.JSONDecodeError:
-                continue
-
-            if data.get("type") == "conversation":
-                conversation = data.get("messages", [])
-                continue
-
-            if data.get("type") == "end_audio":
-                # All audio received, process now
-                if not audio_chunks:
-                    ws.send(json.dumps({"type": "error", "error": "No audio"}))
-                    continue
-
-                total_start = time.time()
-
-                # STT via Deepgram streaming
-                t0 = time.time()
-                result = {"interim": "", "final": "", "error": None}
-                run_deepgram_stream(audio_chunks, result)
-                stt_time = time.time() - t0
-
-                transcript = result["final"]
-                if result["error"]:
-                    print(f"[STT] Error: {result['error']}")
-                    ws.send(json.dumps({"type": "error", "error": f"STT: {result['error']}"}))
-                    audio_chunks = []
-                    continue
-
-                print(f"[STT] {stt_time:.2f}s: {transcript}")
-
-                if not transcript.strip():
-                    ws.send(json.dumps({"type": "error", "error": "Empty transcript"}))
-                    audio_chunks = []
-                    continue
-
-                ws.send(json.dumps({"type": "transcript", "text": transcript}))
-
-                # LLM
-                t0 = time.time()
-                try:
-                    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation + [{"role": "user", "content": transcript}]
-                    response = openai_client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=messages,
-                        max_tokens=80,
-                        temperature=0.7,
-                    )
-                    reply = response.choices[0].message.content.strip()
-                    llm_time = time.time() - t0
-                    print(f"[LLM] {llm_time:.2f}s: {reply}")
-                except Exception as e:
-                    ws.send(json.dumps({"type": "error", "error": f"LLM: {e}"}))
-                    audio_chunks = []
-                    continue
-
-                ws.send(json.dumps({"type": "llm_reply", "text": reply}))
-
-                # TTS
-                t0 = time.time()
-                try:
-                    resp = http_session.post(TTS_URL, json={"text": reply}, timeout=30)
-                    resp.raise_for_status()
-                    tts_data = resp.json()
-                    tts_audio_b64 = tts_data.get("audio_b64", "")
-                    tts_time = time.time() - t0
-                    print(f"[TTS] {tts_time:.2f}s")
-                except Exception as e:
-                    tts_audio_b64 = ""
-                    tts_time = time.time() - t0
-                    print(f"[TTS] Error: {e}")
-
-                total = time.time() - total_start
-                print(f"[TOTAL] {total:.2f}s")
-
-                ws.send(json.dumps({
-                    "type": "result",
-                    "transcript": transcript,
-                    "response": reply,
-                    "audio_b64": tts_audio_b64,
-                    "latency": {
-                        "stt": round(stt_time, 2),
-                        "llm": round(llm_time, 2),
-                        "tts": round(tts_time, 2),
-                        "total": round(total, 2),
-                    }
-                }))
-
-                audio_chunks = []
-                continue
-
-        # Binary message = audio chunk
-        if isinstance(msg, bytes):
-            audio_chunks.append(msg)
-
-
-# ============================================================
-# Fallback REST API (keep for compatibility)
-# ============================================================
-
-@app.route("/api/chat", methods=["POST"])
-def chat():
-    data = request.json
-    audio_b64 = data.get("audio_b64", "")
-    conversation = data.get("conversation", [])
-
-    if not audio_b64:
-        return jsonify({"error": "No audio"}), 400
-
-    audio_bytes = base64.b64decode(audio_b64)
-    total_start = time.time()
-
-    # STT (Deepgram REST - fallback)
-    try:
-        t0 = time.time()
-        resp = http_session.post(
-            "https://api.deepgram.com/v1/listen?model=nova-2&language=vi",
-            headers={
-                "Authorization": f"Token {DEEPGRAM_API_KEY}",
-                "Content-Type": "audio/wav",
-            },
-            data=audio_bytes,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        transcript = resp.json()["results"]["channels"][0]["alternatives"][0]["transcript"]
-        stt_time = time.time() - t0
-
-        if not transcript.strip():
-            return jsonify({"error": "Empty transcript"}), 200
-    except Exception as e:
-        return jsonify({"error": f"STT failed: {e}"}), 500
-
-    # LLM
-    try:
-        t0 = time.time()
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation + [{"role": "user", "content": transcript}]
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            max_tokens=80,
-            temperature=0.7,
-        )
-        reply = response.choices[0].message.content.strip()
-        llm_time = time.time() - t0
-    except Exception as e:
-        return jsonify({"error": f"LLM failed: {e}"}), 500
-
-    # TTS
-    try:
-        t0 = time.time()
-        resp = http_session.post(TTS_URL, json={"text": reply}, timeout=30)
-        resp.raise_for_status()
-        tts_data = resp.json()
-        tts_audio_b64 = tts_data.get("audio_b64", "")
-        tts_time = time.time() - t0
-    except Exception as e:
-        return jsonify({"error": f"TTS failed: {e}"}), 500
-
-    total = time.time() - total_start
-    return jsonify({
-        "transcript": transcript,
-        "response": reply,
-        "audio_b64": tts_audio_b64,
-        "latency": {
-            "stt": round(stt_time, 2),
-            "llm": round(llm_time, 2),
-            "tts": round(tts_time, 2),
-            "total": round(total, 2),
-        }
-    })
-
-
-# ============================================================
-# Web UI
+# Routes
 # ============================================================
 
 @app.route("/")
 def index():
-    return HTML_PAGE
+    return HTML_PAGE.replace("{{WS_URL}}", WS_URL).replace("{{POD_URL}}", POD_URL)
 
 
-HTML_PAGE = """<!DOCTYPE html>
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
@@ -355,49 +49,37 @@ body {
     flex-direction: column;
     align-items: center;
 }
-.container {
-    max-width: 500px;
-    width: 100%;
-    padding: 20px;
-}
+.container { max-width: 500px; width: 100%; padding: 20px; }
 h1 {
-    text-align: center;
-    font-size: 1.5em;
-    margin: 20px 0;
+    text-align: center; font-size: 1.5em; margin: 20px 0;
     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
 }
+.conn-badge {
+    text-align: center; font-size: 0.75em; margin-bottom: 10px;
+    padding: 4px 12px; border-radius: 12px; display: inline-block;
+}
+.conn-badge.ws { background: #1a2e1a; color: #4ade80; }
+.conn-badge.http { background: #2e2a1a; color: #fbbf24; }
+.conn-badge.disconnected { background: #2e1a1a; color: #f87171; }
+.header-row { text-align: center; }
 .status {
-    text-align: center;
-    padding: 10px;
-    margin: 10px 0;
-    border-radius: 10px;
-    font-size: 0.9em;
-    background: #1a1a2e;
+    text-align: center; padding: 10px; margin: 10px 0;
+    border-radius: 10px; font-size: 0.9em; background: #1a1a2e;
 }
 .status.listening { background: #1a2e1a; color: #4ade80; }
 .status.processing { background: #2e2a1a; color: #fbbf24; }
 .status.speaking { background: #1a1a2e; color: #818cf8; }
 .status.error { background: #2e1a1a; color: #f87171; }
-.status.transcribing { background: #1a2e2e; color: #22d3ee; }
 
 #mic-btn {
-    display: block;
-    margin: 30px auto;
-    width: 120px;
-    height: 120px;
-    border-radius: 50%;
-    border: 3px solid #333;
-    background: #1a1a2e;
-    cursor: pointer;
-    font-size: 40px;
-    transition: all 0.3s;
+    display: block; margin: 30px auto; width: 120px; height: 120px;
+    border-radius: 50%; border: 3px solid #333; background: #1a1a2e;
+    cursor: pointer; font-size: 40px; transition: all 0.3s;
 }
 #mic-btn:hover { border-color: #667eea; }
 #mic-btn.active {
-    border-color: #4ade80;
-    background: #1a2e1a;
+    border-color: #4ade80; background: #1a2e1a;
     animation: pulse 1.5s infinite;
 }
 @keyframes pulse {
@@ -405,41 +87,15 @@ h1 {
     50% { box-shadow: 0 0 0 20px rgba(74,222,128,0); }
 }
 
-.volume-bar {
-    width: 200px;
-    height: 6px;
-    background: #1a1a2e;
-    border-radius: 3px;
-    margin: 15px auto;
-    overflow: hidden;
-}
-.volume-fill {
-    height: 100%;
-    width: 0%;
-    background: linear-gradient(90deg, #4ade80, #fbbf24, #f87171);
-    transition: width 0.05s;
-    border-radius: 3px;
-}
+.volume-bar { width: 200px; height: 6px; background: #1a1a2e; border-radius: 3px; margin: 15px auto; overflow: hidden; }
+.volume-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #4ade80, #fbbf24, #f87171); transition: width 0.05s; border-radius: 3px; }
 
-.chat-log {
-    margin-top: 20px;
-    max-height: 400px;
-    overflow-y: auto;
-}
-.msg {
-    padding: 10px 14px;
-    margin: 8px 0;
-    border-radius: 12px;
-    font-size: 0.9em;
-    line-height: 1.4;
-}
+.chat-log { margin-top: 20px; max-height: 400px; overflow-y: auto; }
+.msg { padding: 10px 14px; margin: 8px 0; border-radius: 12px; font-size: 0.9em; line-height: 1.4; }
 .msg.user { background: #1a2e1a; border-left: 3px solid #4ade80; }
 .msg.bot { background: #1a1a2e; border-left: 3px solid #818cf8; }
 .msg .meta { font-size: 0.75em; color: #666; margin-top: 4px; }
-.auto-toggle {
-    text-align: center;
-    margin: 10px 0;
-}
+.auto-toggle { text-align: center; margin: 10px 0; }
 .auto-toggle label { cursor: pointer; font-size: 0.85em; color: #888; }
 .auto-toggle input { margin-right: 5px; }
 </style>
@@ -447,126 +103,238 @@ h1 {
 <body>
 <div class="container">
     <h1>Voice Chat</h1>
+    <div class="header-row">
+        <span id="conn-badge" class="conn-badge disconnected">Connecting...</span>
+    </div>
     <div class="auto-toggle">
         <label><input type="checkbox" id="auto-mode" checked> Auto-detect speech (VAD)</label>
     </div>
-    <div id="status" class="status">Click mic or enable auto-detect</div>
+    <div id="status" class="status">Connecting to server...</div>
     <button id="mic-btn">🎤</button>
     <div class="volume-bar"><div class="volume-fill" id="volume"></div></div>
     <div class="chat-log" id="chat-log"></div>
 </div>
 
 <script>
+// ============================================================
+// Config
+// ============================================================
+const WS_URL = '{{WS_URL}}';
+const POD_URL = '{{POD_URL}}';
+
+const SPEECH_THRESHOLD = 25;
+const SILENCE_TIMEOUT = 200;   // ms silence before sending (lower = faster response)
+const MIN_SPEECH_MS = 250;
+
+// ============================================================
+// State
+// ============================================================
+let ws = null;
+let useWebSocket = true;
 let mediaStream = null;
-let audioContext = null;
+let recCtx = null;       // Recording AudioContext (16kHz)
 let analyser = null;
+let recorder = null;
+let chunks = [];
 let isRecording = false;
-let isProcessing = false;
+let isPlaying = false;    // Audio is currently playing from speaker
+let isAwaitingResponse = false;  // Waiting for server response
 let conversation = [];
 let silenceTimer = null;
 let speechDetected = false;
-let ws = null;
-let scriptProcessor = null;
+let speechStart = 0;
+let turnTranscripts = {};  // turn_id -> transcript text
+let currentTurnId = 0;     // Increment each request — only play matching turn
+
+// Playback
+let playCtx = null;      // Playback AudioContext
+let nextPlayTime = 0;
+let activeSources = [];
 
 const micBtn = document.getElementById('mic-btn');
 const statusEl = document.getElementById('status');
 const volumeEl = document.getElementById('volume');
 const chatLog = document.getElementById('chat-log');
 const autoMode = document.getElementById('auto-mode');
+const connBadge = document.getElementById('conn-badge');
 
-// VAD params
-const SPEECH_THRESHOLD = 25;
-const SILENCE_TIMEOUT = 700;
-const MIN_SPEECH_MS = 300;
-let speechStart = 0;
+// ============================================================
+// WebSocket
+// ============================================================
+let wsReconnectTimer = null;
 
-// Connect WebSocket
 function connectWS() {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(proto + '//' + location.host + '/ws/voice');
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+
+    ws = new WebSocket(WS_URL);
     ws.binaryType = 'arraybuffer';
 
-    ws.onopen = () => console.log('[WS] Connected');
-    ws.onclose = () => {
-        console.log('[WS] Disconnected, reconnecting...');
-        setTimeout(connectWS, 1000);
+    ws.onopen = () => {
+        useWebSocket = true;
+        connBadge.className = 'conn-badge ws';
+        connBadge.textContent = 'WebSocket';
+        setStatus('listening', 'Connected! Listening...');
+        console.log('[WS] Connected');
     };
-    ws.onmessage = (e) => {
-        const data = JSON.parse(e.data);
-        handleWSMessage(data);
+
+    ws.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+            // Binary = [4 bytes turn_id BE][WAV data]
+            if (event.data.byteLength < 5) return;  // too small
+            const view = new DataView(event.data);
+            const serverTurnId = view.getUint32(0, false);  // big-endian
+            if (serverTurnId !== currentTurnId) {
+                console.log('[WS] Stale audio chunk turn=' + serverTurnId + ' current=' + currentTurnId);
+                return;
+            }
+            const wavData = event.data.slice(4);
+            playAudioChunk(wavData, serverTurnId);
+        } else {
+            // Text = JSON message
+            try {
+                const msg = JSON.parse(event.data);
+                // Filter by turn_id if present
+                if (msg.turn_id !== undefined && msg.turn_id !== currentTurnId) {
+                    console.log('[WS] Stale message turn=' + msg.turn_id + ' current=' + currentTurnId);
+                    return;
+                }
+                handleServerMessage(msg);
+            } catch(e) {
+                console.error('[WS] Bad message:', e);
+            }
+        }
+    };
+
+    ws.onclose = () => {
+        console.log('[WS] Disconnected');
+        if (useWebSocket) {
+            connBadge.className = 'conn-badge disconnected';
+            connBadge.textContent = 'Reconnecting...';
+            wsReconnectTimer = setTimeout(connectWS, 3000);
+        }
+    };
+
+    ws.onerror = (err) => {
+        console.error('[WS] Error, falling back to HTTP');
+        useWebSocket = false;
+        ws.close();
+        connBadge.className = 'conn-badge http';
+        connBadge.textContent = 'HTTP (fallback)';
+        setStatus('listening', 'Using HTTP fallback. Listening...');
     };
 }
 
-function handleWSMessage(data) {
-    if (data.type === 'transcript') {
-        addMsg('user', data.text);
-        setStatus('processing', 'Thinking...');
-    } else if (data.type === 'llm_reply') {
-        // Show reply immediately, before TTS
-        setStatus('speaking', 'Generating voice...');
-    } else if (data.type === 'result') {
-        // Update bot message with full result
-        addMsg('bot', data.response, data.latency);
-        conversation.push({ role: 'user', content: data.transcript });
-        conversation.push({ role: 'assistant', content: data.response });
-        if (conversation.length > 20) conversation = conversation.slice(-20);
-
-        if (data.audio_b64) {
-            setStatus('speaking', 'Speaking...');
-            playAudio(data.audio_b64).then(() => {
-                isProcessing = false;
-                if (autoMode.checked) setStatus('listening', 'Listening...');
-            });
-        } else {
-            isProcessing = false;
-            if (autoMode.checked) setStatus('listening', 'Listening...');
+function handleServerMessage(msg) {
+    switch(msg.type) {
+        case 'transcript':
+            // Store transcript keyed by turn_id
+            turnTranscripts[msg.turn_id || currentTurnId] = msg.text;
+            addMsg('user', msg.text);
+            setStatus('processing', 'Thinking...');
+            break;
+        case 'response': {
+            const turnId = msg.turn_id || currentTurnId;
+            const transcript = turnTranscripts[turnId] || '';
+            addMsg('bot', msg.text, msg.latency, msg.metrics);
+            if (transcript) {
+                conversation.push({role: 'user', content: transcript});
+            }
+            conversation.push({role: 'assistant', content: msg.text});
+            if (conversation.length > 20) conversation = conversation.slice(-20);
+            // Clean up old transcripts
+            delete turnTranscripts[turnId];
+            // Wait for audio to finish, then resume listening
+            waitForPlaybackDone();
+            break;
         }
-    } else if (data.type === 'error') {
-        if (data.error !== 'Empty transcript') {
-            setStatus('error', data.error);
-        }
-        isProcessing = false;
-        if (autoMode.checked) setStatus('listening', 'Listening...');
+        case 'error':
+            if (msg.error !== 'Empty transcript') setStatus('error', msg.error);
+            isAwaitingResponse = false;
+            isPlaying = false;
+            if (autoMode.checked) setTimeout(() => setStatus('listening', 'Listening...'), 1000);
+            break;
     }
 }
 
-// Init mic with ScriptProcessor for raw PCM
+function waitForPlaybackDone() {
+    const turnAtCall = currentTurnId;
+    const checkDone = () => {
+        // Stop checking if turn changed (barge-in)
+        if (turnAtCall !== currentTurnId) return;
+        if (activeSources.length === 0 && (!playCtx || playCtx.currentTime >= nextPlayTime - 0.05)) {
+            isAwaitingResponse = false;
+            isPlaying = false;
+            if (autoMode.checked) setStatus('listening', 'Listening...');
+        } else {
+            setTimeout(checkDone, 100);
+        }
+    };
+    setTimeout(checkDone, 300);
+}
+
+// ============================================================
+// Streaming Audio Playback
+// ============================================================
+function playAudioChunk(wavArrayBuffer, turnId) {
+    // Skip if turn has changed (barge-in happened)
+    if (turnId !== currentTurnId) return;
+
+    if (!playCtx) {
+        playCtx = new AudioContext({ latencyHint: 'interactive' });
+    }
+
+    isPlaying = true;
+    setStatus('speaking', 'Speaking...');
+
+    // decodeAudioData needs a copy (it detaches the buffer)
+    playCtx.decodeAudioData(wavArrayBuffer.slice(0), (audioBuffer) => {
+        // Guard AGAIN inside callback — turn may have changed during decode
+        if (turnId !== currentTurnId) return;
+
+        const source = playCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(playCtx.destination);
+
+        const now = playCtx.currentTime;
+        const startTime = Math.max(now + 0.02, nextPlayTime);
+        source.start(startTime);
+        nextPlayTime = startTime + audioBuffer.duration;
+
+        activeSources.push(source);
+        source.onended = () => {
+            const idx = activeSources.indexOf(source);
+            if (idx >= 0) activeSources.splice(idx, 1);
+            if (activeSources.length === 0) isPlaying = false;
+        };
+    }, (err) => {
+        console.error('[Audio] Decode error:', err);
+    });
+}
+
+function stopPlayback() {
+    for (const src of activeSources) {
+        try { src.stop(); } catch(e) {}
+    }
+    activeSources = [];
+    nextPlayTime = 0;
+}
+
+// ============================================================
+// Microphone & VAD
+// ============================================================
 async function initMic() {
     if (mediaStream) return;
     mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
     });
-    audioContext = new AudioContext({ sampleRate: 16000 });
-    const source = audioContext.createMediaStreamSource(mediaStream);
-
-    analyser = audioContext.createAnalyser();
+    recCtx = new AudioContext({ sampleRate: 16000 });
+    const source = recCtx.createMediaStreamSource(mediaStream);
+    analyser = recCtx.createAnalyser();
     analyser.fftSize = 512;
     source.connect(analyser);
-
-    // ScriptProcessor to capture raw PCM for streaming
-    scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
-    source.connect(scriptProcessor);
-    scriptProcessor.connect(audioContext.destination);
-    scriptProcessor.onaudioprocess = (e) => {
-        if (!isRecording) return;
-        const float32 = e.inputBuffer.getChannelData(0);
-        // Convert float32 to int16
-        const int16 = new Int16Array(float32.length);
-        for (let i = 0; i < float32.length; i++) {
-            const s = Math.max(-1, Math.min(1, float32[i]));
-            int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        }
-        // Send raw PCM via WebSocket
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(int16.buffer);
-        }
-    };
-
-    connectWS();
     if (autoMode.checked) startVAD();
 }
 
-// Volume meter
 function updateVolume() {
     if (!analyser) return 0;
     const data = new Uint8Array(analyser.frequencyBinCount);
@@ -576,17 +344,24 @@ function updateVolume() {
     return avg;
 }
 
-// VAD
 function startVAD() {
     setStatus('listening', 'Listening...');
     function checkVAD() {
-        if (!autoMode.checked || isProcessing) {
+        if (!autoMode.checked) {
             requestAnimationFrame(checkVAD);
             return;
         }
         const level = updateVolume();
         if (level > SPEECH_THRESHOLD) {
             if (!isRecording) {
+                // ALWAYS stop audio when user speaks — no state check needed
+                currentTurnId++;
+                stopPlayback();
+                isAwaitingResponse = false;
+                isPlaying = false;
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({type: 'interrupt'}));
+                }
                 startRecording();
                 speechStart = Date.now();
             }
@@ -604,79 +379,201 @@ function startVAD() {
 }
 
 function startRecording() {
-    if (isRecording || isProcessing) return;
+    if (isRecording || isAwaitingResponse) return;
+    chunks = [];
+    recorder = new MediaRecorder(mediaStream, { mimeType: 'audio/webm;codecs=opus' });
+    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+    recorder.start(100);
     isRecording = true;
     speechDetected = false;
     micBtn.classList.add('active');
-    // Send conversation context
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'conversation', messages: conversation }));
-    }
 }
 
-function stopAndSend() {
-    if (isProcessing || !isRecording) return;
-    isRecording = false;
-    isProcessing = true;
-    micBtn.classList.remove('active');
-    setStatus('processing', 'Processing speech...');
-    // Signal end of audio
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'end_audio' }));
-    }
-}
-
-// Play audio
-function playAudio(b64) {
+function stopRecording() {
     return new Promise(resolve => {
-        const audio = new Audio('data:audio/wav;base64,' + b64);
-        audio.onended = resolve;
-        audio.onerror = resolve;
-        audio.play();
+        if (!recorder || recorder.state === 'inactive') { resolve(null); return; }
+        recorder.onstop = async () => {
+            const blob = new Blob(chunks, { type: 'audio/webm' });
+            const arrayBuf = await blob.arrayBuffer();
+            const audioBuf = await recCtx.decodeAudioData(arrayBuf);
+            const wav = audioBufferToWav(audioBuf);
+            resolve(wav);
+        };
+        recorder.stop();
+        isRecording = false;
+        micBtn.classList.remove('active');
     });
 }
 
-// UI
+async function stopAndSend() {
+    if (isAwaitingResponse) return;
+    const wavBytes = await stopRecording();
+    if (!wavBytes || wavBytes.byteLength < 1000) {
+        if (autoMode.checked) setStatus('listening', 'Listening...');
+        return;
+    }
+
+    currentTurnId++;  // New turn — invalidate old audio
+    isAwaitingResponse = true;
+    isPlaying = false;
+    setStatus('processing', 'Processing...');
+    nextPlayTime = 0;
+
+    if (useWebSocket && ws && ws.readyState === WebSocket.OPEN) {
+        sendViaWebSocket(wavBytes);
+    } else {
+        sendViaHTTP(wavBytes);
+    }
+}
+
+// ============================================================
+// Send: WebSocket (primary)
+// ============================================================
+function sendViaWebSocket(wavBytes) {
+    // Send binary WAV
+    ws.send(wavBytes);
+    // Send process command with turn_id so server can tag responses
+    ws.send(JSON.stringify({
+        type: 'process',
+        turn_id: currentTurnId,
+        conversation: conversation
+    }));
+}
+
+// ============================================================
+// Send: HTTP POST (fallback)
+// ============================================================
+async function sendViaHTTP(wavBytes) {
+    const b64 = arrayBufferToBase64(wavBytes);
+
+    try {
+        const resp = await fetch(POD_URL + '/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ audio_b64: b64, conversation: conversation }),
+        });
+        const data = await resp.json();
+
+        if (data.error) {
+            if (data.error !== 'Empty transcript') setStatus('error', data.error);
+            isAwaitingResponse = false; isPlaying = false;
+            if (autoMode.checked) setStatus('listening', 'Listening...');
+            return;
+        }
+
+        addMsg('user', data.transcript);
+        addMsg('bot', data.response, data.latency, data.metrics);
+
+        conversation.push({ role: 'user', content: data.transcript });
+        conversation.push({ role: 'assistant', content: data.response });
+        if (conversation.length > 20) conversation = conversation.slice(-20);
+
+        // Play audio
+        if (data.audio_b64) {
+            setStatus('speaking', 'Speaking...');
+            const wavResp = base64ToArrayBuffer(data.audio_b64);
+            playAudioChunk(wavResp, currentTurnId);
+            waitForPlaybackDone();
+        } else {
+            isAwaitingResponse = false; isPlaying = false;
+            if (autoMode.checked) setStatus('listening', 'Listening...');
+        }
+    } catch (e) {
+        setStatus('error', 'Connection error: ' + e.message);
+        isAwaitingResponse = false; isPlaying = false;
+        if (autoMode.checked) setTimeout(() => setStatus('listening', 'Listening...'), 2000);
+    }
+}
+
+// ============================================================
+// UI Helpers
+// ============================================================
 function setStatus(cls, text) {
     statusEl.className = 'status ' + cls;
     statusEl.textContent = text;
 }
 
-function addMsg(role, text, latency) {
+function addMsg(role, text, latency, metrics) {
     const div = document.createElement('div');
     div.className = 'msg ' + role;
-    let html = (role === 'user' ? '🎤 ' : '🤖 ') + text;
+    let html = (role === 'user' ? '&#127908; ' : '&#129302; ') + escapeHtml(text);
     if (latency) {
-        html += '<div class="meta">STT ' + latency.stt + 's | LLM ' + latency.llm + 's | TTS ' + latency.tts + 's | Total ' + latency.total + 's</div>';
+        let metaStr = 'STT ' + latency.stt + 's | LLM ' + latency.llm + 's | TTS ' + latency.tts + 's | Total ' + latency.total + 's';
+        if (metrics) {
+            if (metrics.input_snr != null) metaStr += ' | SNR ' + metrics.input_snr + 'dB';
+            if (metrics.stt_confidence != null) metaStr += ' | Conf ' + metrics.stt_confidence;
+            if (metrics.noise_suppressed) metaStr += ' | NS &#10003;';
+        }
+        html += '<div class="meta">' + metaStr + '</div>';
     }
     div.innerHTML = html;
     chatLog.appendChild(div);
     chatLog.scrollTop = chatLog.scrollHeight;
 }
 
-// Manual mic
+function escapeHtml(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+}
+
+// ============================================================
+// Audio encoding helpers
+// ============================================================
+function audioBufferToWav(buffer) {
+    const numCh = 1, sr = buffer.sampleRate, bps = 16;
+    const samples = buffer.getChannelData(0);
+    const dataLen = samples.length * 2;
+    const buf = new ArrayBuffer(44 + dataLen);
+    const v = new DataView(buf);
+    function ws(o, s) { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); }
+    ws(0,'RIFF'); v.setUint32(4,36+dataLen,true); ws(8,'WAVE'); ws(12,'fmt ');
+    v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,numCh,true);
+    v.setUint32(24,sr,true); v.setUint32(28,sr*numCh*bps/8,true);
+    v.setUint16(32,numCh*bps/8,true); v.setUint16(34,bps,true);
+    ws(36,'data'); v.setUint32(40,dataLen,true);
+    let o = 44;
+    for (let i = 0; i < samples.length; i++) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        o += 2;
+    }
+    return buf;
+}
+
+function arrayBufferToBase64(buf) {
+    const bytes = new Uint8Array(buf);
+    let bin = '';
+    for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+}
+
+function base64ToArrayBuffer(b64) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes.buffer;
+}
+
+// ============================================================
+// Event listeners
+// ============================================================
 micBtn.addEventListener('click', async () => {
     await initMic();
-    if (isProcessing) return;
-    if (isRecording) {
-        stopAndSend();
-    } else {
-        startRecording();
-        setStatus('listening', 'Recording... click to stop');
-    }
+    if (isAwaitingResponse) return;
+    if (isRecording) { stopAndSend(); }
+    else { startRecording(); setStatus('listening', 'Recording... click to stop'); }
 });
 
-// Auto mode toggle
 autoMode.addEventListener('change', async () => {
-    if (autoMode.checked) {
-        await initMic();
-        startVAD();
-    } else {
-        setStatus('', 'Click mic to record');
-    }
+    if (autoMode.checked) { await initMic(); startVAD(); }
+    else { setStatus('', 'Click mic to record'); }
 });
 
-// Auto-init
+// ============================================================
+// Init
+// ============================================================
+connectWS();
 initMic().catch(() => setStatus('', 'Click mic to start'));
 </script>
 </body>
@@ -689,11 +586,9 @@ initMic().catch(() => setStatus('', 'Click mic to start'));
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("Voice Chat Web UI (Streaming STT)")
-    print(f"  STT: Deepgram Nova-2 (WebSocket streaming)")
-    print(f"  LLM: OpenAI gpt-4o-mini (max_tokens=80)")
-    print(f"  TTS: SparkTTS on RunPod Pod")
-    print(f"  TTS URL: {TTS_URL}")
+    print("Voice Chat Web UI (WebSocket + Binary)")
+    print(f"  Pod:  {POD_URL}")
+    print(f"  WS:   {WS_URL}")
     print(f"  Open: http://localhost:5050")
     print("=" * 50)
     app.run(host="0.0.0.0", port=5050, debug=False)

@@ -1,23 +1,21 @@
 """
-All-in-One Voice Server — STT + LLM + TTS trên 1 GPU
+All-in-One Voice Server — STT + LLM + TTS tren 1 GPU
   STT: Faster-Whisper large-v3
-  LLM: Qwen2.5-7B-Instruct-AWQ
-  TTS: Matcha-TTS (giọng Nguyễn Ngọc Ngạn)
+  LLM: Qwen2.5-7B-Instruct (local GPU) hoac GPT-4o-mini (API fallback)
+  TTS: StyleTTS2-lite-vi
+  Hot-reload: POST /reload to reload handlers.py without restarting models
 
-Single endpoint: POST /chat  audio_b64 in → audio_b64 out
-Chạy trên RunPod pod với GPU.
-
-Usage:
-    pip install faster-whisper flask flask-cors huggingface_hub
-    pip install git+https://github.com/phineas-pta/MatchaTTS_ngngngan.git
-    python all_in_one_server.py
+This file: model loading + Flask routes (NOT reloadable)
+handlers.py: all processing logic (reloadable via POST /reload)
 """
 import os
-import io
+import sys
 import time
 import base64
-import wave
-import re
+import json
+import struct
+import importlib
+import threading
 
 import torch
 import numpy as np
@@ -25,7 +23,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 # ============================================================
-# Config
+# Config (model-loading related — NOT reloadable)
 # ============================================================
 
 PORT = int(os.environ.get("PORT", "7860"))
@@ -35,29 +33,28 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "large-v3")
 
 # LLM
-QWEN_MODEL = os.environ.get("QWEN_MODEL", "Qwen/Qwen2.5-7B-Instruct-AWQ")
-LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "96"))
-LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.5"))
-SYSTEM_PROMPT = (
-    "Bạn là trợ lý AI nói tiếng Việt. "
-    "Quy tắc BẮT BUỘC: CHỈ trả lời bằng tiếng Việt thuần túy. "
-    "TUYỆT ĐỐI KHÔNG dùng tiếng Trung, tiếng Anh, hay bất kỳ ngôn ngữ nào khác. "
-    "Trả lời ngắn gọn, tự nhiên, tối đa 2 câu."
-)
+LLM_MODE = os.environ.get("LLM_MODE", "local")
+LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 # TTS
-MATCHA_REPO = "doof-ferb/matcha_ngngngan"
-MATCHA_STEPS = int(os.environ.get("MATCHA_STEPS", "10"))
-MATCHA_TEMP = float(os.environ.get("MATCHA_TEMP", "0.667"))
-MATCHA_LENGTH_SCALE = float(os.environ.get("MATCHA_LENGTH_SCALE", "0.95"))
-TTS_SAMPLE_RATE = 22050
+STYLETTS2_MODEL_DIR = os.environ.get("STYLETTS2_MODEL_DIR", "/workspace/styletts2_lite_vi")
+TTS_SAMPLE_RATE = int(os.environ.get("TTS_SAMPLE_RATE", "24000"))
+STYLETTS2_ALPHA = float(os.environ.get("STYLETTS2_ALPHA", "0.3"))
+STYLETTS2_BETA = float(os.environ.get("STYLETTS2_BETA", "0.7"))
+STYLETTS2_DIFFUSION_STEPS = int(os.environ.get("STYLETTS2_STEPS", "5"))
+STYLETTS2_REF_AUDIO = os.environ.get("STYLETTS2_REF_AUDIO", "")
+
+# Noise suppression
+ENABLE_DEEPFILTER = os.environ.get("ENABLE_DEEPFILTER", "0") == "1"
 
 # ============================================================
-# Load all models
+# Load all models (one-time, stays in GPU memory)
 # ============================================================
 
 print(f"[INIT] Device: {DEVICE}")
-print(f"[INIT] Loading 3 models...")
+print(f"[INIT] LLM mode: {LLM_MODE}")
+print(f"[INIT] Loading models...")
 total_t0 = time.time()
 
 # --- STT: Faster-Whisper ---
@@ -67,110 +64,192 @@ from faster_whisper import WhisperModel
 stt_model = WhisperModel(WHISPER_MODEL_SIZE, device=DEVICE, compute_type="float16" if DEVICE == "cuda" else "int8")
 print(f"[STT] Loaded in {time.time()-t0:.1f}s")
 
-# --- LLM: Qwen ---
-print(f"[LLM] Loading {QWEN_MODEL}...")
+# --- LLM ---
+llm_model = None
+llm_tokenizer = None
+llm_client = None
+
+if LLM_MODE == "local":
+    print(f"[LLM] Loading {LLM_MODEL} on GPU...")
+    t0 = time.time()
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    llm_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL, trust_remote_code=True)
+    llm_model = AutoModelForCausalLM.from_pretrained(
+        LLM_MODEL,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    print(f"[LLM] Loaded in {time.time()-t0:.1f}s")
+else:
+    print(f"[LLM] Using {LLM_MODEL} via OpenAI API")
+    from openai import OpenAI
+    llm_client = OpenAI(api_key=OPENAI_API_KEY)
+    if not OPENAI_API_KEY:
+        print("[LLM] WARNING: OPENAI_API_KEY not set!")
+
+# --- TTS: StyleTTS2-lite-vi ---
+print(f"[TTS] Loading StyleTTS2-lite-vi from {STYLETTS2_MODEL_DIR}...")
 t0 = time.time()
-from transformers import AutoModelForCausalLM, AutoTokenizer
-HF_TOKEN = os.environ.get("HF_TOKEN")
+styletts2_model = None
+_tts_method = None
 
-llm_tokenizer = AutoTokenizer.from_pretrained(QWEN_MODEL, trust_remote_code=True, token=HF_TOKEN)
-llm_model = AutoModelForCausalLM.from_pretrained(
-    QWEN_MODEL, torch_dtype=torch.float16, device_map="auto",
-    trust_remote_code=True, token=HF_TOKEN,
-)
-print(f"[LLM] Loaded in {time.time()-t0:.1f}s")
+try:
+    from styletts2 import tts as StyleTTS2Module
+    import glob as _glob
 
-# --- TTS: Matcha-TTS ---
-print(f"[TTS] Loading Matcha-TTS...")
-t0 = time.time()
-from huggingface_hub import hf_hub_download
-from matcha.cli import get_torch_device, load_matcha, load_vocoder, process_text, to_waveform
+    _ckpt = os.environ.get("STYLETTS2_CKPT", "")
+    _config = os.environ.get("STYLETTS2_CONFIG", "")
 
-matcha_model_path = hf_hub_download(repo_id=MATCHA_REPO, filename="ckpt/checkpoint_epoch420_slim.pt")
-matcha_vocoder_path = hf_hub_download(repo_id=MATCHA_REPO, filename="hifigan/g_02500000")
-matcha_model = load_matcha(matcha_model_path, DEVICE)
-matcha_vocoder, matcha_denoiser = load_vocoder(matcha_vocoder_path, DEVICE)
-print(f"[TTS] Loaded in {time.time()-t0:.1f}s")
+    if not _ckpt:
+        for _ext in ("*.pth", "*.pt", "*.ckpt", "*.safetensors"):
+            _found = sorted(_glob.glob(os.path.join(STYLETTS2_MODEL_DIR, "**/" + _ext), recursive=True))
+            if _found:
+                _ckpt = _found[0]
+                break
+    if not _config:
+        for _ext in ("*.yml", "*.yaml", "*.json"):
+            _found = sorted(_glob.glob(os.path.join(STYLETTS2_MODEL_DIR, "**/" + _ext), recursive=True))
+            if _found:
+                _config = _found[0]
+                break
+
+    print(f"[TTS] Model dir contents:")
+    for _f in sorted(_glob.glob(os.path.join(STYLETTS2_MODEL_DIR, "*"))):
+        print(f"[TTS]   {_f}")
+
+    if _ckpt and _config:
+        print(f"[TTS] pip package | ckpt={_ckpt}")
+        print(f"[TTS] pip package | config={_config}")
+        styletts2_model = StyleTTS2Module.StyleTTS2(
+            model_checkpoint_path=_ckpt,
+            config_path=_config,
+        )
+        _tts_method = "pip"
+    else:
+        raise FileNotFoundError(f"No model/config found in {STYLETTS2_MODEL_DIR}")
+except Exception as e1:
+    print(f"[TTS] pip package failed: {e1}")
+    try:
+        if STYLETTS2_MODEL_DIR not in sys.path:
+            sys.path.insert(0, STYLETTS2_MODEL_DIR)
+        from inference import StyleTTS2 as LocalStyleTTS2
+        styletts2_model = LocalStyleTTS2(config_path=_config, models_path=_ckpt).eval().to(DEVICE)
+        _tts_method = "local"
+        print(f"[TTS] Using local inference.py from {STYLETTS2_MODEL_DIR}")
+    except Exception as e2:
+        print(f"[TTS] local inference.py also failed: {e2}")
+        import traceback
+        traceback.print_exc()
+        print("[TTS] WARNING: TTS unavailable — audio responses will be empty")
+
+if styletts2_model:
+    print(f"[TTS] Loaded via '{_tts_method}' in {time.time()-t0:.1f}s")
+
+# Auto-detect reference audio
+_tts_ref_audio_path = STYLETTS2_REF_AUDIO
+if not _tts_ref_audio_path:
+    import glob as _glob2
+    _ref_candidates = sorted(_glob2.glob(os.path.join(STYLETTS2_MODEL_DIR, "reference_audio", "vn_*.wav")))
+    if not _ref_candidates:
+        _ref_candidates = sorted(_glob2.glob(os.path.join(STYLETTS2_MODEL_DIR, "reference_audio", "*.wav")))
+    if _ref_candidates:
+        _tts_ref_audio_path = _ref_candidates[0]
+        print(f"[TTS] Reference audio: {_tts_ref_audio_path}")
+    else:
+        print("[TTS] No reference audio found")
+
+# Precompute styles
+_tts_styles = None
+if styletts2_model and _tts_method == "local" and _tts_ref_audio_path:
+    try:
+        _speakers = {"id_1": {"path": _tts_ref_audio_path, "lang": "vi", "speed": 1.0}}
+        with torch.no_grad():
+            _tts_styles = styletts2_model.get_styles(_speakers, denoise=0.6, avg_style=True)
+        print(f"[TTS] Precomputed styles from {_tts_ref_audio_path}")
+    except Exception as e:
+        print(f"[TTS] Failed to precompute styles: {e}")
+
+# --- Noise Suppression ---
+df_model = None
+df_state = None
+df_enhance_fn = None
+
+if ENABLE_DEEPFILTER:
+    print("[NS] Loading DeepFilterNet...")
+    t0 = time.time()
+    try:
+        from df.enhance import enhance as _df_enhance, init_df
+        df_model, df_state, _ = init_df()
+        df_enhance_fn = _df_enhance
+        print(f"[NS] DeepFilterNet loaded in {time.time()-t0:.1f}s (sr={df_state.sr()})")
+    except Exception as e:
+        print(f"[NS] DeepFilterNet not available: {e}")
+        ENABLE_DEEPFILTER = False
 
 print(f"[INIT] All models loaded in {time.time()-total_t0:.1f}s")
 
+# ============================================================
+# Model context dict — passed to handlers
+# ============================================================
+
+_model_ctx = {
+    "stt_model": stt_model,
+    "llm_model": llm_model,
+    "llm_tokenizer": llm_tokenizer,
+    "llm_client": llm_client,
+    "llm_mode": LLM_MODE,
+    "llm_model_name": LLM_MODEL,
+    "styletts2_model": styletts2_model,
+    "tts_method": _tts_method,
+    "tts_styles": _tts_styles,
+    "tts_ref_audio_path": _tts_ref_audio_path,
+    "tts_sample_rate": TTS_SAMPLE_RATE,
+    "df_model": df_model,
+    "df_state": df_state,
+    "df_enhance_fn": df_enhance_fn,
+    "enable_deepfilter": ENABLE_DEEPFILTER,
+    "device": DEVICE,
+}
+
+# ============================================================
+# Initialize handlers
+# ============================================================
+
+import handlers
+handlers.init(_model_ctx)
+
+# ============================================================
 # Warmup
+# ============================================================
+
 print("[INIT] Warming up...")
 with torch.inference_mode():
-    # STT warmup
     segments, _ = stt_model.transcribe(np.zeros(16000, dtype=np.float32), language="vi")
     list(segments)
-    # TTS warmup
-    out = process_text("xin chào", DEVICE)
-    mel = matcha_model.synthesise(out["x"], out["x_lengths"], n_timesteps=MATCHA_STEPS, temperature=MATCHA_TEMP, spks=None, length_scale=MATCHA_LENGTH_SCALE)
-    _ = to_waveform(mel["mel"], matcha_vocoder, matcha_denoiser)
-print("[INIT] Ready!")
 
-# ============================================================
-# Helper functions
-# ============================================================
+    if styletts2_model is not None:
+        try:
+            if _tts_method == "pip":
+                styletts2_model.inference("xin chào",
+                    alpha=STYLETTS2_ALPHA, beta=STYLETTS2_BETA,
+                    diffusion_steps=STYLETTS2_DIFFUSION_STEPS, embedding_scale=1)
+            elif _tts_styles:
+                styletts2_model.generate("xin chào", _tts_styles)
+            print(f"[TTS] Warmup OK")
+        except Exception as e:
+            print(f"[TTS] Warmup failed: {e}")
 
-def stt_transcribe(audio_bytes):
-    """Transcribe audio bytes to text."""
-    buf = io.BytesIO(audio_bytes)
-    import soundfile as sf
-    audio_np, sr = sf.read(buf)
-    if len(audio_np.shape) > 1:
-        audio_np = audio_np.mean(axis=1)
-    audio_np = audio_np.astype(np.float32)
-
-    segments, info = stt_model.transcribe(audio_np, language="vi")
-    text = " ".join([s.text for s in segments]).strip()
-    return text
-
-
-def llm_generate(user_text, conversation=None):
-    """Generate LLM response."""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    if conversation:
-        messages.extend(conversation)
-    messages.append({"role": "user", "content": user_text})
-
-    text_input = llm_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = llm_tokenizer(text_input, return_tensors="pt").to(llm_model.device)
-
-    with torch.inference_mode():
-        outputs = llm_model.generate(
-            **inputs,
-            max_new_tokens=LLM_MAX_TOKENS,
-            temperature=LLM_TEMPERATURE,
-            do_sample=True,
-            top_p=0.9,
+    if llm_model:
+        _warmup_text = llm_tokenizer.apply_chat_template(
+            [{"role": "system", "content": handlers.SYSTEM_PROMPT},
+             {"role": "user", "content": "xin chao"}],
+            tokenize=False, add_generation_prompt=True,
         )
-
-    new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
-    response = llm_tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-    return response
-
-
-@torch.inference_mode()
-def tts_synthesize(text):
-    """Synthesize text to WAV bytes."""
-    text = text.strip()
-    if not text:
-        return None
-
-    text_out = process_text(text, DEVICE)
-    mel_out = matcha_model.synthesise(
-        text_out["x"], text_out["x_lengths"],
-        n_timesteps=MATCHA_STEPS, temperature=MATCHA_TEMP,
-        spks=None, length_scale=MATCHA_LENGTH_SCALE,
-    )
-    waveform = to_waveform(mel_out["mel"], matcha_vocoder, matcha_denoiser).numpy()
-
-    audio_int16 = (waveform * 32767).astype(np.int16)
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(TTS_SAMPLE_RATE)
-        wf.writeframes(audio_int16.tobytes())
-    return buf.getvalue()
+        _warmup_ids = llm_tokenizer(_warmup_text, return_tensors="pt").to(DEVICE)
+        with torch.no_grad():
+            llm_model.generate(**_warmup_ids, max_new_tokens=5)
+print("[INIT] Ready!")
 
 
 # ============================================================
@@ -181,22 +260,52 @@ app = Flask(__name__)
 CORS(app)
 
 
+def _reload_handlers():
+    """Reload handlers.py, preserve mute state."""
+    old_muted = getattr(handlers, '_muted', False)
+    importlib.reload(handlers)
+    handlers._muted = old_muted
+    handlers.init(_model_ctx)
+    return True
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
         "device": str(DEVICE),
+        "llm_mode": LLM_MODE,
+        "noise_suppression": ENABLE_DEEPFILTER,
         "models": {
             "stt": WHISPER_MODEL_SIZE,
-            "llm": QWEN_MODEL,
-            "tts": MATCHA_REPO,
+            "llm": LLM_MODEL,
+            "tts": {
+                "engine": "StyleTTS2-lite-vi",
+                "method": _tts_method,
+                "model_dir": STYLETTS2_MODEL_DIR,
+                "sample_rate": TTS_SAMPLE_RATE,
+                "diffusion_steps": STYLETTS2_DIFFUSION_STEPS,
+            },
         }
     })
 
 
+@app.route("/reload", methods=["POST"])
+def reload_code():
+    """Hot-reload handlers.py without restarting models."""
+    try:
+        _reload_handlers()
+        print("[RELOAD] handlers.py reloaded successfully")
+        return jsonify({"status": "ok", "message": "handlers.py reloaded"})
+    except Exception as e:
+        print(f"[RELOAD] Failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @app.route("/chat", methods=["POST"])
 def chat():
-    """Full pipeline: audio_b64 in → audio_b64 out."""
     data = request.json or {}
     audio_b64 = data.get("audio_b64", "")
     conversation = data.get("conversation", [])
@@ -204,78 +313,28 @@ def chat():
     if not audio_b64:
         return jsonify({"error": "Missing audio_b64"}), 400
 
-    audio_bytes = base64.b64decode(audio_b64)
-    total_start = time.time()
+    if conversation and isinstance(conversation, list):
+        conversation = conversation[-20:]
+    else:
+        conversation = []
 
-    # STT
-    try:
-        t0 = time.time()
-        transcript = stt_transcribe(audio_bytes)
-        stt_time = time.time() - t0
-        print(f"[STT] {stt_time:.2f}s: {transcript}")
-
-        if not transcript:
-            return jsonify({"error": "Empty transcript"}), 200
-    except Exception as e:
-        print(f"[STT] Error: {e}")
-        return jsonify({"error": f"STT failed: {e}"}), 500
-
-    # LLM
-    try:
-        t0 = time.time()
-        reply = llm_generate(transcript, conversation)
-        llm_time = time.time() - t0
-        print(f"[LLM] {llm_time:.2f}s: {reply}")
-    except Exception as e:
-        print(f"[LLM] Error: {e}")
-        return jsonify({"error": f"LLM failed: {e}"}), 500
-
-    # TTS
-    try:
-        t0 = time.time()
-        wav_bytes = tts_synthesize(reply)
-        tts_time = time.time() - t0
-        print(f"[TTS] {tts_time:.2f}s")
-
-        audio_out_b64 = base64.b64encode(wav_bytes).decode() if wav_bytes else ""
-    except Exception as e:
-        print(f"[TTS] Error: {e}")
-        return jsonify({"error": f"TTS failed: {e}"}), 500
-
-    total = time.time() - total_start
-    print(f"[TOTAL] {total:.2f}s | STT {stt_time:.2f} + LLM {llm_time:.2f} + TTS {tts_time:.2f}")
-
-    return jsonify({
-        "transcript": transcript,
-        "response": reply,
-        "audio_b64": audio_out_b64,
-        "sample_rate": TTS_SAMPLE_RATE,
-        "latency": {
-            "stt": round(stt_time, 2),
-            "llm": round(llm_time, 2),
-            "tts": round(tts_time, 2),
-            "total": round(total, 2),
-        }
-    })
+    result, status_code = handlers.handle_chat(audio_b64, conversation)
+    return jsonify(result), status_code
 
 
 @app.route("/tts/b64", methods=["POST"])
 def tts_only():
-    """TTS only endpoint (for testing)."""
     data = request.json or {}
     text = data.get("text", "").strip()
     if not text:
         return jsonify({"error": "Missing text"}), 400
-
     t0 = time.time()
-    wav_bytes = tts_synthesize(text)
+    waveform = handlers.tts_synthesize(text)
     tts_time = time.time() - t0
-
-    if not wav_bytes:
+    if waveform is None:
         return jsonify({"error": "TTS failed"}), 500
-
     return jsonify({
-        "audio_b64": base64.b64encode(wav_bytes).decode(),
+        "audio_b64": base64.b64encode(handlers.waveform_to_wav_bytes(waveform)).decode(),
         "sample_rate": TTS_SAMPLE_RATE,
         "tts_time": round(tts_time, 3),
     })
@@ -283,21 +342,86 @@ def tts_only():
 
 @app.route("/stt", methods=["POST"])
 def stt_only():
-    """STT only endpoint (for testing)."""
     data = request.json or {}
     audio_b64 = data.get("audio_b64", "")
     if not audio_b64:
         return jsonify({"error": "Missing audio_b64"}), 400
-
     audio_bytes = base64.b64decode(audio_b64)
     t0 = time.time()
-    transcript = stt_transcribe(audio_bytes)
-    stt_time = time.time() - t0
-
+    transcript, metrics = handlers.stt_transcribe(audio_bytes)
     return jsonify({
         "transcript": transcript,
-        "stt_time": round(stt_time, 3),
+        "stt_time": round(time.time() - t0, 3),
+        "metrics": metrics,
     })
+
+
+# ============================================================
+# WebSocket endpoint
+# ============================================================
+
+try:
+    from flask_sock import Sock
+    sock = Sock(app)
+
+    @sock.route("/ws")
+    def ws_chat(ws):
+        print("[WS] Client connected")
+        audio_data = None
+        cancel_event = threading.Event()
+        process_thread = None
+
+        while True:
+            try:
+                data = ws.receive(timeout=300)
+            except Exception:
+                break
+
+            if data is None:
+                break
+
+            if isinstance(data, bytes):
+                audio_data = data
+            elif isinstance(data, str):
+                try:
+                    msg = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+                if msg.get("type") == "interrupt":
+                    cancel_event.set()
+                    ws.send(json.dumps({"type": "interrupted"}))
+                    print("[WS] Barge-in: client requested interrupt")
+
+                elif msg.get("type") == "process" and audio_data is not None:
+                    cancel_event.set()
+                    if process_thread and process_thread.is_alive():
+                        process_thread.join(timeout=3)
+
+                    client_turn_id = int(msg.get("turn_id", 0))
+                    conversation = msg.get("conversation", [])
+                    if isinstance(conversation, list):
+                        conversation = [
+                            m for m in conversation[-20:]
+                            if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+                        ]
+                    else:
+                        conversation = []
+
+                    cancel_event = threading.Event()
+                    process_thread = threading.Thread(
+                        target=handlers.handle_ws_process,
+                        args=(ws, audio_data, conversation, cancel_event, client_turn_id),
+                        daemon=True,
+                    )
+                    process_thread.start()
+                    audio_data = None
+
+        print("[WS] Client disconnected")
+
+    print("[WS] WebSocket endpoint enabled at /ws")
+except ImportError:
+    print("[WS] flask-sock not installed — WebSocket disabled")
 
 
 if __name__ == "__main__":

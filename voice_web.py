@@ -122,11 +122,13 @@ h1 {
 const WS_URL = '{{WS_URL}}';
 const POD_URL = '{{POD_URL}}';
 
-const SPEECH_THRESHOLD = 25;          // Volume threshold khi idle
-const BARGEIN_THRESHOLD = 50;         // Volume threshold khi đang phát audio (cao hơn)
-const BARGEIN_SUSTAIN = 5;            // Phải vượt threshold 5 frames liên tục (~80ms) mới barge-in
+const SPEECH_THRESHOLD = 30;          // Volume threshold khi idle (listening)
+const BARGEIN_THRESHOLD = 45;         // Volume threshold khi đang phát audio (cao hơn để tránh false trigger)
+const BARGEIN_SUSTAIN_FRAMES = 8;     // Phải vượt threshold liên tục N frames (~130ms) mới barge-in
 const SILENCE_TIMEOUT = 150;          // ms silence before sending
 const MIN_SPEECH_MS = 200;
+const SPEECH_FREQ_LOW = 300;          // Hz — giọng nói bắt đầu từ ~300Hz
+const SPEECH_FREQ_HIGH = 3500;        // Hz — giọng nói chủ yếu dưới 3500Hz
 
 // ============================================================
 // State
@@ -140,13 +142,6 @@ let analyser = null;
 let isRecording = false;
 let isPlaying = false;    // Audio is currently playing from speaker
 let isAwaitingResponse = false;  // Waiting for server response
-let conversation = [];
-let silenceTimer = null;
-let speechDetected = false;
-let speechStart = 0;
-let turnTranscripts = {};  // turn_id -> transcript text
-let currentTurnId = 0;     // Increment each request — only play matching turn
-let speechFrameCount = 0;  // Consecutive frames above threshold (for barge-in)
 
 // Pre-buffer: rolling ring buffer to capture audio BEFORE VAD triggers
 const PRE_BUFFER_MS = 300;       // Keep last 300ms of audio
@@ -155,6 +150,13 @@ const PRE_BUFFER_LEN = Math.ceil(PRE_BUFFER_MS / 1000 * PRE_BUFFER_SR);
 let preBuffer = new Float32Array(PRE_BUFFER_LEN);
 let preBufferWritePos = 0;
 let preBufferFilled = false;     // true once we've wrapped around at least once
+let conversation = [];
+let silenceTimer = null;
+let speechDetected = false;
+let speechStart = 0;
+let turnTranscripts = {};  // turn_id -> transcript text
+let currentTurnId = 0;     // Increment each request — only play matching turn
+let speechFrameCount = 0;  // Consecutive frames above threshold (for barge-in)
 
 // Playback
 let playCtx = null;      // Playback AudioContext
@@ -198,8 +200,6 @@ function connectWS() {
                 return;
             }
             const wavData = event.data.slice(4);
-            // Reset playback timeline for first chunk of new response
-            if (!isPlaying) nextPlayTime = 0;
             playAudioChunk(wavData, serverTurnId);
         } else {
             // Text = JSON message
@@ -270,19 +270,9 @@ function handleServerMessage(msg) {
 
 function waitForPlaybackDone() {
     const turnAtCall = currentTurnId;
-    const startTime = Date.now();
-    const MAX_WAIT_MS = 15000; // Safety: max 15s wait, then force reset
     const checkDone = () => {
         // Stop checking if turn changed (barge-in)
         if (turnAtCall !== currentTurnId) return;
-        // Safety timeout: force reset after 15s to prevent permanent stuck state
-        if (Date.now() - startTime > MAX_WAIT_MS) {
-            console.warn('[VAD] waitForPlaybackDone timeout — force reset');
-            isAwaitingResponse = false;
-            isPlaying = false;
-            if (autoMode.checked) setStatus('listening', 'Listening...');
-            return;
-        }
         if (activeSources.length === 0 && (!playCtx || playCtx.currentTime >= nextPlayTime - 0.05)) {
             isAwaitingResponse = false;
             isPlaying = false;
@@ -303,10 +293,6 @@ function playAudioChunk(wavArrayBuffer, turnId) {
 
     if (!playCtx) {
         playCtx = new AudioContext({ latencyHint: 'interactive' });
-    }
-    // Chrome suspends AudioContext until user gesture — resume it
-    if (playCtx.state === 'suspended') {
-        playCtx.resume();
     }
 
     isPlaying = true;
@@ -387,12 +373,32 @@ async function initMic() {
 }
 
 function updateVolume() {
-    if (!analyser) return 0;
+    if (!analyser) return { total: 0, speech: 0, isSpeechLike: false };
     const data = new Uint8Array(analyser.frequencyBinCount);
     analyser.getByteFrequencyData(data);
-    const avg = data.reduce((a, b) => a + b, 0) / data.length;
-    volumeEl.style.width = Math.min(100, avg / 128 * 100) + '%';
-    return avg;
+
+    // Total volume
+    const total = data.reduce((a, b) => a + b, 0) / data.length;
+    volumeEl.style.width = Math.min(100, total / 128 * 100) + '%';
+
+    // Speech band energy (300-3500 Hz)
+    const sr = recCtx ? recCtx.sampleRate : 16000;
+    const binHz = sr / (analyser.fftSize || 512);
+    const lowBin = Math.floor(SPEECH_FREQ_LOW / binHz);
+    const highBin = Math.min(Math.ceil(SPEECH_FREQ_HIGH / binHz), data.length - 1);
+
+    let speechSum = 0;
+    let speechCount = 0;
+    for (let i = lowBin; i <= highBin; i++) {
+        speechSum += data[i];
+        speechCount++;
+    }
+    const speech = speechCount > 0 ? speechSum / speechCount : 0;
+
+    // Speech-like = speech band energy is dominant (>60% of total energy)
+    const isSpeechLike = total > 10 && (speech / (total + 0.001)) > 0.6;
+
+    return { total, speech, isSpeechLike };
 }
 
 function startVAD() {
@@ -402,47 +408,56 @@ function startVAD() {
             requestAnimationFrame(checkVAD);
             return;
         }
-        const level = updateVolume();
+        const { total, speech, isSpeechLike } = updateVolume();
 
-        // When awaiting response and not playing audio → IGNORE all sound (prevent cancel loop)
-        if (isAwaitingResponse && !isPlaying) {
-            requestAnimationFrame(checkVAD);
-            return;
-        }
+        // State-based logic:
+        // 1. isPlaying = audio playing from speaker → allow barge-in with high threshold
+        // 2. isAwaitingResponse && !isPlaying = waiting for server, no audio yet → IGNORE noise
+        // 3. idle (neither) = normal listening → start recording with low threshold
+        const isIdle = !isPlaying && !isAwaitingResponse && !isRecording;
+        const canBargeIn = isPlaying && !isRecording;
+        const threshold = canBargeIn ? BARGEIN_THRESHOLD : SPEECH_THRESHOLD;
 
-        if (isPlaying && level > BARGEIN_THRESHOLD) {
-            // Barge-in: require sustained loud sound before interrupting
-            speechFrameCount++;
-            if (speechFrameCount >= BARGEIN_SUSTAIN && !isRecording) {
-                console.log('[VAD] Barge-in triggered, level=' + level);
-                currentTurnId++;
-                stopPlayback();
-                isAwaitingResponse = false;
-                isPlaying = false;
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({type: 'interrupt'}));
+        // Check if speech-like sound above threshold
+        const isSpeech = speech > threshold && isSpeechLike;
+
+        if (isSpeech) {
+            if (canBargeIn) {
+                // Barge-in mode: require sustained speech frames before interrupting
+                speechFrameCount++;
+                if (speechFrameCount >= BARGEIN_SUSTAIN_FRAMES) {
+                    // Confirmed human speech — interrupt playback
+                    currentTurnId++;
+                    stopPlayback();
+                    isAwaitingResponse = false;
+                    isPlaying = false;
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({type: 'interrupt'}));
+                    }
+                    startRecording();
+                    speechStart = Date.now();
+                    speechFrameCount = 0;
                 }
+            } else if (isIdle) {
+                // Idle mode: start recording immediately
                 startRecording();
                 speechStart = Date.now();
                 speechFrameCount = 0;
             }
-        } else if (!isPlaying && level > SPEECH_THRESHOLD && !isRecording) {
-            // Idle: start recording immediately
-            startRecording();
-            speechStart = Date.now();
-            speechFrameCount = 0;
-        } else if (level <= BARGEIN_THRESHOLD) {
-            speechFrameCount = 0;
-        }
+            // If isAwaitingResponse && !isPlaying → do nothing (wait for server)
 
-        if (level > SPEECH_THRESHOLD && isRecording) {
-            speechDetected = true;
-            clearTimeout(silenceTimer);
-            silenceTimer = setTimeout(() => {
-                if (isRecording && speechDetected && (Date.now() - speechStart > MIN_SPEECH_MS)) {
-                    stopAndSend();
-                }
-            }, SILENCE_TIMEOUT);
+            if (isRecording) {
+                speechDetected = true;
+                clearTimeout(silenceTimer);
+                silenceTimer = setTimeout(() => {
+                    if (isRecording && speechDetected && (Date.now() - speechStart > MIN_SPEECH_MS)) {
+                        stopAndSend();
+                    }
+                }, SILENCE_TIMEOUT);
+            }
+        } else {
+            // Reset sustained counter when no speech detected
+            speechFrameCount = 0;
         }
         requestAnimationFrame(checkVAD);
     }
@@ -451,7 +466,18 @@ function startVAD() {
 
 function startRecording() {
     if (isRecording || isAwaitingResponse) return;
+    // Prepend pre-buffer so we capture the speech onset (first syllables)
     pcmChunks = [];
+    if (preBufferFilled) {
+        // Ring buffer: read from writePos to end, then 0 to writePos
+        const part1 = preBuffer.slice(preBufferWritePos);
+        const part2 = preBuffer.slice(0, preBufferWritePos);
+        pcmChunks.push(new Float32Array(part1));
+        pcmChunks.push(new Float32Array(part2));
+    } else if (preBufferWritePos > 0) {
+        // Haven't filled the ring buffer yet, just use what we have
+        pcmChunks.push(new Float32Array(preBuffer.slice(0, preBufferWritePos)));
+    }
     isRecording = true;
     speechDetected = false;
     micBtn.classList.add('active');
@@ -462,17 +488,6 @@ function stopRecording() {
         if (!isRecording && pcmChunks.length === 0) { resolve(null); return; }
         isRecording = false;
         micBtn.classList.remove('active');
-
-        // Prepend pre-buffer so we capture the speech onset (first syllables)
-        if (preBufferFilled) {
-            // Ring buffer: read from writePos to end, then 0 to writePos
-            const part1 = preBuffer.slice(preBufferWritePos);
-            const part2 = preBuffer.slice(0, preBufferWritePos);
-            pcmChunks.unshift(new Float32Array(part2));
-            pcmChunks.unshift(new Float32Array(part1));
-        } else if (preBufferWritePos > 0) {
-            pcmChunks.unshift(new Float32Array(preBuffer.slice(0, preBufferWritePos)));
-        }
 
         // Merge PCM chunks into single Float32Array
         const totalLen = pcmChunks.reduce((acc, c) => acc + c.length, 0);

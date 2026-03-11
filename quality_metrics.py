@@ -312,4 +312,3 @@ def summarize_metrics(metrics_file, last_n=100):
             ) if total_lats else 0,
         },
     }
-

@@ -362,4 +362,3 @@ def execute_tool(name, arguments):
     except Exception as e:
         print(f"[TOOL] {name} error: {e}")
         return {"error": str(e)}
-

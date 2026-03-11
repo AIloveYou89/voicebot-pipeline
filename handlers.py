@@ -208,6 +208,10 @@ _PHONE_PATTERN = re.compile(
     r'\b(1[89]00[\s.-]?\d{1,4}[\s.-]?\d{0,4})\b'   # 1900/1800 + nhóm số
     r'|'
     r'\b(0\d{2,3}[\s.-]?\d{3,4}[\s.-]?\d{3,4})\b'   # 0xxx xxx xxxx
+    r'|'
+    r'\b(0\d{8,9})\b'                                 # 0xxxxxxxxx liền nhau (9-10 số)
+    r'|'
+    r'\b(\d{7,})\b'                                   # Dãy 7+ số liền — đọc từng chữ số
 )
 
 # Số + đơn vị (không phải điện thoại)
@@ -533,6 +537,8 @@ def normalize_for_tts(text):
     text = _phonetic_english(text)
     text = _normalize_numbers(text)
     text = _lowercase_vietnamese(text)
+    # Loại bỏ ký tự Trung/Nhật/Hàn (Qwen hay bị leak)
+    text = re.sub(r'[\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f\uff00-\uffef]+', '', text)
     # Dọn khoảng trắng thừa
     text = re.sub(r'\s+', ' ', text).strip()
     return text

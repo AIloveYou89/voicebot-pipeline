@@ -1,119 +1,232 @@
 #!/bin/bash
 # ==============================================
-# Voicebot All-in-One — Startup Script
-# Docker image has all deps pre-installed.
-# Only downloads models if not found on network volume.
+# Voicebot All-in-One — Auto Startup Script
+# Luu tai /workspace/voicebot-pipeline/start.sh
+# Chay: bash /workspace/voicebot-pipeline/start.sh
 #
-# Usage:
-#   bash /app/start.sh          (from Docker image)
-#   bash /workspace/voicebot-pipeline/start.sh  (from volume)
+# KHONG dung set -e (che loi am).
+# Dung trap ERR + log tung buoc.
+#
+# --- TTS ENGINE ---
+# F5-TTS-Vietnamese-ViVoice (1000h Vietnamese speech)
+# Repo: https://github.com/nguyenthienhy/F5-TTS-Vietnamese
+# Model: https://huggingface.co/hynt/F5-TTS-Vietnamese-ViVoice
+#
+# Noise suppression: DeepFilterNet (server-side, before Whisper)
+# Disable: export ENABLE_DEEPFILTER=0
 # ==============================================
 
 set -uo pipefail
 
 LOG_FILE="/workspace/voicebot-pipeline/server.log"
-HF_HOME="${HF_HOME:-/workspace/huggingface}"
-F5_TTS_MODEL_DIR="/workspace/F5-TTS-Vietnamese-ViVoice"
-F5_TTS_REPO="${F5_TTS_REPO_DIR:-/opt/F5-TTS-Vietnamese}"
 
-export HF_HOME PORT="${PORT:-5300}"
-mkdir -p "$(dirname "$LOG_FILE")" "$HF_HOME"
-
+# Error trap — log dong loi thay vi chet am
 trap 'echo "[ERROR] FAILED at line $LINENO (exit code $?)" | tee -a "$LOG_FILE"' ERR
 
-log() { echo "[$(date +%H:%M:%S)] $1" | tee -a "$LOG_FILE"; }
+cd /workspace/voicebot-pipeline
 
-log "=============================================="
-log "  Voicebot All-in-One Startup"
-log "  Port: $PORT | Time: $(date)"
-log "  TTS: F5-TTS-Vietnamese-ViVoice"
-log "=============================================="
+export PORT="${PORT:-5300}"
+VENV_DIR="/workspace/voicebot-pipeline/.venv"
+REQ_HASH_FILE="$VENV_DIR/.req_hash"
+F5TTS_MARKER="$VENV_DIR/.f5tts_installed"
+DEEPFILTER_MARKER="$VENV_DIR/.deepfilter_installed"
+PIP_CACHE_DIR="${PIP_CACHE_DIR:-/workspace/pip-cache}"
+HF_HOME="${HF_HOME:-/workspace/huggingface}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-/workspace/.cache}"
+CONSTRAINTS_FILE="/workspace/voicebot-pipeline/constraints.txt"
+BASE_REQ_MARKER_INPUTS=(
+    "$CONSTRAINTS_FILE"
+    "/workspace/voicebot-pipeline/start.sh"
+)
 
-# --- Step 1: Download models only if missing on volume ---
+# F5-TTS paths
+F5_TTS_REPO="/workspace/F5-TTS-Vietnamese"
+F5_TTS_MODEL_DIR="/workspace/F5-TTS-Vietnamese-ViVoice"
 
-# STT: Faster-Whisper large-v3
-if [ ! -d "$HF_HOME/hub/models--Systran--faster-whisper-large-v3" ]; then
-    log "Downloading Whisper large-v3 (~3GB)..."
-    python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', device='cpu', compute_type='int8')" 2>&1 | tee -a "$LOG_FILE"
-    log "Whisper downloaded."
-else
-    log "Whisper already cached."
+mkdir -p "$PIP_CACHE_DIR" "$HF_HOME" "$XDG_CACHE_HOME"
+export HF_HOME XDG_CACHE_HOME PIP_CACHE_DIR
+
+echo "==============================================" | tee -a "$LOG_FILE"
+echo "  Voicebot All-in-One Startup" | tee -a "$LOG_FILE"
+echo "  Port: $PORT" | tee -a "$LOG_FILE"
+echo "  Time: $(date)" | tee -a "$LOG_FILE"
+echo "  TTS: F5-TTS-Vietnamese-ViVoice" | tee -a "$LOG_FILE"
+echo "  NS: DeepFilterNet" | tee -a "$LOG_FILE"
+echo "  HF_HOME: $HF_HOME" | tee -a "$LOG_FILE"
+echo "  PIP_CACHE_DIR: $PIP_CACHE_DIR" | tee -a "$LOG_FILE"
+echo "==============================================" | tee -a "$LOG_FILE"
+
+# --- Step 0: Ensure OS deps exist on fresh pod/container ---
+if ! command -v ffmpeg >/dev/null 2>&1 || ! dpkg -s libsndfile1 >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+    echo "[SETUP] Installing OS dependencies..." | tee -a "$LOG_FILE"
+    export DEBIAN_FRONTEND=noninteractive
+    stdbuf -oL apt-get update 2>&1 | tee -a "$LOG_FILE"
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+        echo "[ERROR] apt-get update failed" | tee -a "$LOG_FILE"
+        exit 1
+    fi
+
+    stdbuf -oL apt-get install -y --no-install-recommends \
+        libsndfile1 ffmpeg git 2>&1 | tee -a "$LOG_FILE"
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+        echo "[ERROR] apt-get install failed" | tee -a "$LOG_FILE"
+        exit 1
+    fi
 fi
 
-# LLM: Qwen
-LLM="${LLM_MODEL:-Qwen/Qwen2.5-3B-Instruct}"
-LLM_HF_DIR=$(echo "$LLM" | tr '/' '--')
-if [ ! -d "$HF_HOME/hub/models--${LLM_HF_DIR}" ]; then
-    log "Downloading $LLM..."
-    python -c "from huggingface_hub import snapshot_download; snapshot_download('$LLM')" 2>&1 | tee -a "$LOG_FILE"
-    log "$LLM downloaded."
-else
-    log "$LLM already cached."
+# --- Step 1: Create venv with system-site-packages ---
+VENV_VERSION="v3-f5tts"
+VENV_VERSION_FILE="$VENV_DIR/.venv_version"
+
+CURRENT_VENV_VER=$(cat "$VENV_VERSION_FILE" 2>/dev/null || echo "")
+if [ "$CURRENT_VENV_VER" != "$VENV_VERSION" ]; then
+    if [ -d "$VENV_DIR" ]; then
+        echo "[SETUP] Venv outdated ($CURRENT_VENV_VER → $VENV_VERSION). Rebuilding..." | tee -a "$LOG_FILE"
+        rm -rf "$VENV_DIR"
+    fi
+    echo "[SETUP] Creating virtualenv (system-site-packages)..." | tee -a "$LOG_FILE"
+    python3 -m venv --system-site-packages "$VENV_DIR"
+    if [ $? -ne 0 ]; then
+        echo "[ERROR] Failed to create virtualenv" | tee -a "$LOG_FILE"
+        exit 1
+    fi
+    echo "$VENV_VERSION" > "$VENV_VERSION_FILE"
+    echo "[SETUP] Virtualenv created ($VENV_VERSION)." | tee -a "$LOG_FILE"
 fi
 
-# TTS: F5-TTS Vietnamese ViVoice
+# Activate venv
+source "$VENV_DIR/bin/activate"
+
+if [ ! -f "$CONSTRAINTS_FILE" ]; then
+    echo "[ERROR] constraints.txt not found: $CONSTRAINTS_FILE" | tee -a "$LOG_FILE"
+    exit 1
+fi
+
+echo "[SETUP] Upgrading pip/setuptools/wheel in venv..." | tee -a "$LOG_FILE"
+stdbuf -oL python -m pip install --cache-dir "$PIP_CACHE_DIR" --upgrade pip setuptools wheel 2>&1 | tee -a "$LOG_FILE"
+if [ ${PIPESTATUS[0]} -ne 0 ]; then
+    echo "[ERROR] pip bootstrap failed" | tee -a "$LOG_FILE"
+    exit 1
+fi
+
+# --- Step 2: Install base deps ---
+CURRENT_HASH=$(cat "${BASE_REQ_MARKER_INPUTS[@]}" | md5sum | cut -d' ' -f1 || echo "none")
+SAVED_HASH=$(cat "$REQ_HASH_FILE" 2>/dev/null || echo "")
+
+if [ "$CURRENT_HASH" != "$SAVED_HASH" ]; then
+    echo "[SETUP] Installing base dependencies..." | tee -a "$LOG_FILE"
+
+    stdbuf -oL python -m pip install --cache-dir "$PIP_CACHE_DIR" -c "$CONSTRAINTS_FILE" \
+        "numpy>=2.0,<3" setuptools wheel packaging \
+        flask flask-cors flask-sock faster-whisper soundfile huggingface_hub openai scipy librosa 2>&1 | tee -a "$LOG_FILE"
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+        echo "[ERROR] pip install (base) failed" | tee -a "$LOG_FILE"
+        exit 1
+    fi
+
+    echo "$CURRENT_HASH" > "$REQ_HASH_FILE"
+    echo "[SETUP] Base dependencies installed." | tee -a "$LOG_FILE"
+else
+    echo "[SETUP] Base dependencies already installed (cached)." | tee -a "$LOG_FILE"
+fi
+
+# --- Step 2b: Install F5-TTS Vietnamese (local fork) ---
+if [ ! -f "$F5TTS_MARKER" ]; then
+    echo "[SETUP] Installing F5-TTS Vietnamese..." | tee -a "$LOG_FILE"
+
+    # Clone repo if not exists
+    if [ ! -d "$F5_TTS_REPO" ]; then
+        echo "[SETUP] Cloning F5-TTS-Vietnamese repo..." | tee -a "$LOG_FILE"
+        git clone https://github.com/nguyenthienhy/F5-TTS-Vietnamese "$F5_TTS_REPO" 2>&1 | tee -a "$LOG_FILE"
+    fi
+
+    # Install as editable package
+    stdbuf -oL python -m pip install --cache-dir "$PIP_CACHE_DIR" -e "$F5_TTS_REPO" 2>&1 | tee -a "$LOG_FILE"
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+        echo "[ERROR] pip install (f5-tts) failed" | tee -a "$LOG_FILE"
+        exit 1
+    fi
+
+    echo "$(date)" > "$F5TTS_MARKER"
+    echo "[SETUP] F5-TTS Vietnamese installed." | tee -a "$LOG_FILE"
+else
+    echo "[SETUP] F5-TTS Vietnamese already installed (cached)." | tee -a "$LOG_FILE"
+fi
+
+# --- Step 2c: Install DeepFilterNet noise suppression ---
+if [ ! -f "$DEEPFILTER_MARKER" ]; then
+    echo "[SETUP] Installing DeepFilterNet..." | tee -a "$LOG_FILE"
+
+    stdbuf -oL python -m pip install --cache-dir "$PIP_CACHE_DIR" -c "$CONSTRAINTS_FILE" \
+        deepfilternet 2>&1 | tee -a "$LOG_FILE"
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+        echo "[WARN] DeepFilterNet install failed — continuing without noise suppression" | tee -a "$LOG_FILE"
+        export ENABLE_DEEPFILTER=0
+    else
+        echo "$(date)" > "$DEEPFILTER_MARKER"
+        echo "[SETUP] DeepFilterNet installed." | tee -a "$LOG_FILE"
+    fi
+else
+    echo "[SETUP] DeepFilterNet already installed (cached)." | tee -a "$LOG_FILE"
+fi
+
+# --- Step 2d: Download F5-TTS model from HuggingFace ---
 if [ ! -d "$F5_TTS_MODEL_DIR" ] || [ -z "$(ls -A "$F5_TTS_MODEL_DIR" 2>/dev/null)" ]; then
-    log "Downloading F5-TTS-Vietnamese-ViVoice (~5GB)..."
-    python -c "from huggingface_hub import snapshot_download; snapshot_download('hynt/F5-TTS-Vietnamese-ViVoice', local_dir='$F5_TTS_MODEL_DIR')" 2>&1 | tee -a "$LOG_FILE"
+    echo "[SETUP] Downloading F5-TTS-Vietnamese-ViVoice model..." | tee -a "$LOG_FILE"
+    stdbuf -oL python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('hynt/F5-TTS-Vietnamese-ViVoice', local_dir='$F5_TTS_MODEL_DIR')
+print('Model downloaded to $F5_TTS_MODEL_DIR')
+" 2>&1 | tee -a "$LOG_FILE"
+    if [ ${PIPESTATUS[0]} -ne 0 ]; then
+        echo "[ERROR] F5-TTS model download failed" | tee -a "$LOG_FILE"
+        exit 1
+    fi
+
     # Rename config.json to vocab.txt (required by F5-TTS)
     if [ -f "$F5_TTS_MODEL_DIR/config.json" ] && [ ! -f "$F5_TTS_MODEL_DIR/vocab.txt" ]; then
         mv "$F5_TTS_MODEL_DIR/config.json" "$F5_TTS_MODEL_DIR/vocab.txt"
-        log "Renamed config.json → vocab.txt"
+        echo "[SETUP] Renamed config.json → vocab.txt" | tee -a "$LOG_FILE"
     fi
-    log "F5-TTS model downloaded."
 else
-    log "F5-TTS model already cached."
+    echo "[SETUP] F5-TTS model already downloaded." | tee -a "$LOG_FILE"
 fi
 
-# --- Step 2: Set F5-TTS env ---
-export F5_TTS_REPO_DIR="$F5_TTS_REPO"
-export F5_TTS_CKPT="$F5_TTS_MODEL_DIR/model_last.pt"
-export F5_TTS_VOCAB="$F5_TTS_REPO/vocab.txt"
-export F5_TTS_REF_AUDIO="${F5_TTS_REF_AUDIO:-$F5_TTS_REPO/ref.wav}"
-export F5_TTS_REF_TEXT="${F5_TTS_REF_TEXT:-cả hai bên hãy cố gắng hiểu cho nhau}"
-
-# --- Step 3: Copy models to local SSD for faster loading ---
-LOCAL_HF="/tmp/huggingface"
-if [ ! -d "$LOCAL_HF/hub" ]; then
-    log "Copying models NFS → local SSD..."
-    t_start=$(date +%s)
-    mkdir -p "$LOCAL_HF"
-    cp -r "$HF_HOME/hub" "$LOCAL_HF/hub" 2>/dev/null || true
-    [ -d "$HF_HOME/modules" ] && cp -r "$HF_HOME/modules" "$LOCAL_HF/modules" 2>/dev/null || true
-    t_end=$(date +%s)
-    log "Models copied in $((t_end - t_start))s"
-else
-    log "Models already on local SSD."
-fi
-export HF_HOME="$LOCAL_HF"
-
-# --- Step 4: Use workspace code if available ---
-if [ -d "/workspace/voicebot-pipeline" ] && [ -f "/workspace/voicebot-pipeline/all_in_one_server.py" ]; then
-    cd /workspace/voicebot-pipeline
-    log "Using code from /workspace/voicebot-pipeline"
-else
-    cd /app
-    log "Using code from /app (no workspace code found)"
-fi
-
-# --- Step 5: Smoke test ---
-log "Verifying imports..."
-python -c "
-import torch, numpy
+# --- Step 3: Smoke test imports before serving ---
+echo "[CHECK] Verifying imports..." | tee -a "$LOG_FILE"
+stdbuf -oL python - <<'PY' 2>&1 | tee -a "$LOG_FILE"
+import torch
+import numpy
 from faster_whisper import WhisperModel
-print(f'torch={torch.__version__} cuda={torch.cuda.is_available()} numpy={numpy.__version__}')
+
+print(f"torch={torch.__version__} cuda={torch.cuda.is_available()}")
+print(f"numpy={numpy.__version__}")
+print("faster-whisper OK")
+
 try:
     from f5_tts.api import F5TTS
-    print('f5-tts OK')
+    print("f5-tts OK")
 except ImportError:
-    print('f5-tts NOT available')
+    print("f5-tts NOT installed")
+
 try:
     from df.enhance import enhance, init_df
-    print('deepfilternet OK')
+    print("deepfilternet OK")
 except ImportError:
-    print('deepfilternet NOT available')
-" 2>&1 | tee -a "$LOG_FILE"
+    print("deepfilternet NOT installed — no noise suppression")
+PY
+if [ ${PIPESTATUS[0]} -ne 0 ]; then
+    echo "[ERROR] import smoke test failed" | tee -a "$LOG_FILE"
+    exit 1
+fi
 
-# --- Step 6: Start server ---
-log "Launching all_in_one_server.py on port $PORT..."
-exec python -u all_in_one_server.py 2>&1 | tee -a "$LOG_FILE"
+# --- Step 4: Use models directly from network volume (no SSD copy) ---
+echo "[SPEED] Using models directly from $HF_HOME (no SSD copy)" | tee -a "$LOG_FILE"
+
+# --- Step 5: Start server ---
+echo "[START] Launching all_in_one_server.py on port $PORT..." | tee -a "$LOG_FILE"
+stdbuf -oL python -u all_in_one_server.py 2>&1 | tee -a "$LOG_FILE"
+
+# If we get here, server exited
+EXIT_CODE=$?
+echo "[EXIT] Server exited at $(date) with code $EXIT_CODE" | tee -a "$LOG_FILE"

@@ -93,6 +93,7 @@ SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT",
     "Câu ngắn, tối đa 20 từ mỗi câu. Nếu dài hơn, tách thành 2 câu. "
     "KHÔNG dùng emoji, KHÔNG dùng ký tự đặc biệt. "
     "Trả lời ngắn gọn 1-2 câu, tự nhiên như người thật. "
+    "QUAN TRỌNG: Câu đầu tiên phải cực ngắn (dưới 10 từ) để phản hồi nhanh. VD: 'Dạ, để em kiểm tra nhé.' rồi mới nói chi tiết câu sau. "
     "Nếu khách hỏi gì ngoài phạm vi, nói: 'Dạ, em chưa có thông tin về vấn đề này.'"
 )
 
@@ -1205,16 +1206,18 @@ def llm_generate_api(user_text, conversation=None):
 # ============================================================
 
 @torch.inference_mode()
-def _tts_synthesize_single(text):
+def _tts_synthesize_single(text, nfe_step=None):
     """Synthesize text using F5-TTS."""
     f5_model = _ctx.get("f5_tts_model")
     ref_audio = _ctx.get("f5_tts_ref_audio", "")
     ref_text = _ctx.get("f5_tts_ref_text", "")
     speed = _ctx.get("f5_tts_speed", F5_TTS_SPEED)
+    if nfe_step is None:
+        nfe_step = int(os.environ.get("F5_TTS_NFE_STEP", "16"))
 
     import unicodedata
     text = unicodedata.normalize("NFC", text.strip())
-    print(f"[TTS-IN] '{text}'")
+    print(f"[TTS-IN] '{text}' nfe_step={nfe_step}")
     if not text or f5_model is None:
         return None
 
@@ -1224,6 +1227,7 @@ def _tts_synthesize_single(text):
             ref_text=ref_text,
             gen_text=text,
             speed=speed,
+            nfe_step=nfe_step,
         )
         if isinstance(wav, torch.Tensor):
             wav = wav.cpu().numpy()
@@ -1260,14 +1264,14 @@ def _get_pause_duration(chunk_text):
         return PAUSE_AFTER_COMMA
 
 
-def tts_synthesize(text):
+def tts_synthesize(text, nfe_step=None):
     """Synthesize text → waveform using F5-TTS. Auto-normalizes text."""
     text = text.strip()
     if not text:
         return None
     text = normalize_for_tts(text)
     print(f"[TTS-NORM] '{text}'")
-    return _tts_synthesize_single(text)
+    return _tts_synthesize_single(text, nfe_step=nfe_step)
 
 
 def waveform_to_wav_bytes(waveform):
@@ -1534,7 +1538,7 @@ def handle_ws_process(ws, audio_bytes, conversation, cancel_event=None, turn_id=
                 full_response += token
 
                 # Flush TTS at sentence end only (. ? !)
-                # Không flush tại dấu , — tránh tiếng rè/khựng giữa câu
+                # F5-TTS has ~1.7s fixed overhead per call, so fewer chunks = faster
                 should_flush = SENTENCE_END.search(sentence_buffer)
 
                 if should_flush:
@@ -1626,4 +1630,3 @@ def handle_ws_process(ws, audio_bytes, conversation, cancel_event=None, turn_id=
         import traceback
         traceback.print_exc()
         _send_json({"type": "error", "error": f"Processing failed: {e}"})
-

@@ -272,8 +272,9 @@ def tts_only():
     text = data.get("text", "").strip()
     if not text:
         return jsonify({"error": "Missing text"}), 400
+    nfe_step = data.get("nfe_step", None)
     t0 = time.time()
-    waveform = handlers.tts_synthesize(text)
+    waveform = handlers.tts_synthesize(text, nfe_step=nfe_step)
     tts_time = time.time() - t0
     if waveform is None:
         return jsonify({"error": "TTS failed"}), 500
@@ -408,4 +409,3 @@ except ImportError:
 if __name__ == "__main__":
     print(f"[SERVER] Starting on port {PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
-

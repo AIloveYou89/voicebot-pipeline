@@ -6,6 +6,8 @@ on:
     paths:
       - 'all_in_one_server.py'
       - 'handlers.py'
+      - 'tools.py'
+      - 'quality_metrics.py'
       - 'start.sh'
       - 'Dockerfile'
       - 'constraints.txt'

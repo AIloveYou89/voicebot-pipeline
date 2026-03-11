@@ -1,33 +1,24 @@
-# Core ML
-torchvision
-transformers==4.46.2
+# Core server
+flask
+flask-cors
+flask-sock
 
-# Quantization (Qwen2.5-7B-AWQ)
-autoawq==0.2.7
-
-# Audio I/O
+# ML / inference
+numpy>=2.0,<3
+torch
+torchaudio
+transformers
+accelerate
+faster-whisper
 soundfile
-numpy>=2.0.2
-soxr
-scipy
+scipy>=1.13
+
+# TTS (F5-TTS-Vietnamese) — install local fork: pip install -e /workspace/F5-TTS-Vietnamese
+# f5-tts  # DO NOT install from PyPI, use local fork instead
+vocos
 librosa
+pydub
 
-# SparkTTS dependencies (kept for fallback)
-accelerate>=1.2.0
-einops>=0.8.1
-einx>=0.3.0
-safetensors>=0.5.2
+# API fallback
+openai
 
-# VieNeu-TTS (default engine)
-vieneu
-phonemizer>=3.3.0
-neucodec>=0.0.4
-
-# Text preprocessing
-num2words
-
-# RunPod serverless
-runpod==1.7.9
-
-# HuggingFace model download
-huggingface_hub

@@ -1,49 +1,46 @@
 # ============================================================
-# Voicebot All-in-One — Docker Image
-# Pre-bakes: OS deps, pip packages, model weights
-# Runtime: load models vào GPU (~30s thay vì ~5min download+load)
-#
+# Voicebot All-in-One — Docker Image (deps + tools only)
+# Models: network volume /workspace (NOT baked into image)
+# Claude Code: pre-installed for on-pod editing
 # Image: ghcr.io/ailoveyou89/voicebot-pipeline:latest
 # ============================================================
 
-FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
-
-WORKDIR /app
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 # --- OS deps ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsndfile1 ffmpeg espeak-ng git \
+    libsndfile1 ffmpeg git curl xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# --- Node.js 20 (direct binary — nodesource fails in some DCs) ---
+RUN curl -fsSL https://nodejs.org/dist/v20.18.2/node-v20.18.2-linux-x64.tar.xz \
+    | tar -xJ -C /usr/local --strip-components=1
+
+# --- Claude Code (for editing on pod) ---
+RUN npm install -g @anthropic-ai/claude-code
+
 # --- Python deps (cached layer) ---
-COPY constraints.txt .
-RUN pip install --no-cache-dir \
-    -c constraints.txt \
-    "numpy>=2.0,<3" setuptools wheel packaging \
-    flask flask-cors flask-sock faster-whisper soundfile \
-    huggingface_hub openai scipy \
-    styletts2 phonemizer
+WORKDIR /app
+COPY constraints.txt requirements.txt ./
+RUN pip install --no-cache-dir -c constraints.txt -r requirements.txt \
+    transformers accelerate huggingface_hub
 
-# --- Download models into image ---
-# STT: Faster-Whisper large-v3 (~3GB)
-RUN python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', device='cpu', compute_type='int8')"
+# --- F5-TTS Vietnamese (local fork — editable install) ---
+RUN git clone https://github.com/nguyenthienhy/F5-TTS-Vietnamese /opt/F5-TTS-Vietnamese \
+    && pip install --no-cache-dir -e /opt/F5-TTS-Vietnamese
 
-# LLM: Qwen2.5-7B-Instruct (~15GB)
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-7B-Instruct')"
+# --- DeepFilterNet noise suppression (optional — fail OK) ---
+RUN pip install --no-cache-dir deepfilternet 2>/dev/null || echo "DeepFilterNet skipped"
 
-# TTS: StyleTTS2-lite-vi (~200MB)
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('dangtr0408/StyleTTS2-lite-vi', local_dir='/app/styletts2_lite_vi')"
-
-# --- Copy app code (small layer — fast rebuild on code changes) ---
-COPY all_in_one_server.py handlers.py start.sh ./
+# --- App code (fallback if /workspace not mounted) ---
+COPY all_in_one_server.py handlers.py tools.py quality_metrics.py start.sh ./
+RUN chmod +x start.sh
 
 # --- Env defaults ---
 ENV PORT=5300 \
     LLM_MODE=local \
-    LLM_MODEL=Qwen/Qwen2.5-7B-Instruct \
-    STYLETTS2_MODEL_DIR=/app/styletts2_lite_vi \
+    LLM_MODEL=Qwen/Qwen2.5-3B-Instruct \
+    F5_TTS_REPO_DIR=/opt/F5-TTS-Vietnamese \
     ENABLE_DEEPFILTER=0
 
 EXPOSE 5300
-
-CMD ["python", "-u", "all_in_one_server.py"]

@@ -2,7 +2,7 @@
 All-in-One Voice Server — STT + LLM + TTS tren 1 GPU
   STT: Faster-Whisper large-v3
   LLM: Qwen2.5-7B-Instruct (local GPU) hoac GPT-4o-mini (API fallback)
-  TTS: StyleTTS2-lite-vi
+  TTS: F5-TTS-Vietnamese-ViVoice
   Hot-reload: POST /reload to reload handlers.py without restarting models
 
 This file: model loading + Flask routes (NOT reloadable)
@@ -26,7 +26,7 @@ from flask_cors import CORS
 # Config (model-loading related — NOT reloadable)
 # ============================================================
 
-PORT = int(os.environ.get("PORT", "7860"))
+PORT = int(os.environ.get("PORT", "5300"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # STT
@@ -37,13 +37,14 @@ LLM_MODE = os.environ.get("LLM_MODE", "local")
 LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
-# TTS
-STYLETTS2_MODEL_DIR = os.environ.get("STYLETTS2_MODEL_DIR", "/workspace/styletts2_lite_vi")
+# TTS (F5-TTS)
+F5_TTS_REPO_DIR = os.environ.get("F5_TTS_REPO_DIR", "/workspace/F5-TTS-Vietnamese")
+F5_TTS_CKPT = os.environ.get("F5_TTS_CKPT", "/workspace/F5-TTS-Vietnamese-ViVoice/model_last.pt")
+F5_TTS_VOCAB = os.environ.get("F5_TTS_VOCAB", "/workspace/F5-TTS-Vietnamese/vocab.txt")
+F5_TTS_REF_AUDIO = os.environ.get("F5_TTS_REF_AUDIO", "/workspace/F5-TTS-Vietnamese/ref.wav")
+F5_TTS_REF_TEXT = os.environ.get("F5_TTS_REF_TEXT", "cả hai bên hãy cố gắng hiểu cho nhau")
 TTS_SAMPLE_RATE = int(os.environ.get("TTS_SAMPLE_RATE", "24000"))
-STYLETTS2_ALPHA = float(os.environ.get("STYLETTS2_ALPHA", "0.3"))
-STYLETTS2_BETA = float(os.environ.get("STYLETTS2_BETA", "0.7"))
-STYLETTS2_DIFFUSION_STEPS = int(os.environ.get("STYLETTS2_STEPS", "5"))
-STYLETTS2_REF_AUDIO = os.environ.get("STYLETTS2_REF_AUDIO", "")
+F5_TTS_SPEED = float(os.environ.get("F5_TTS_SPEED", "1.0"))
 
 # Noise suppression
 ENABLE_DEEPFILTER = os.environ.get("ENABLE_DEEPFILTER", "0") == "1"
@@ -88,87 +89,28 @@ else:
     if not OPENAI_API_KEY:
         print("[LLM] WARNING: OPENAI_API_KEY not set!")
 
-# --- TTS: StyleTTS2-lite-vi ---
-print(f"[TTS] Loading StyleTTS2-lite-vi from {STYLETTS2_MODEL_DIR}...")
+# --- TTS: F5-TTS-Vietnamese ---
+print(f"[TTS] Loading F5-TTS-Vietnamese...")
+print(f"[TTS]   ckpt:  {F5_TTS_CKPT}")
+print(f"[TTS]   vocab: {F5_TTS_VOCAB}")
+print(f"[TTS]   ref:   {F5_TTS_REF_AUDIO}")
 t0 = time.time()
-styletts2_model = None
-_tts_method = None
+f5_tts_model = None
 
 try:
-    from styletts2 import tts as StyleTTS2Module
-    import glob as _glob
-
-    _ckpt = os.environ.get("STYLETTS2_CKPT", "")
-    _config = os.environ.get("STYLETTS2_CONFIG", "")
-
-    if not _ckpt:
-        for _ext in ("*.pth", "*.pt", "*.ckpt", "*.safetensors"):
-            _found = sorted(_glob.glob(os.path.join(STYLETTS2_MODEL_DIR, "**/" + _ext), recursive=True))
-            if _found:
-                _ckpt = _found[0]
-                break
-    if not _config:
-        for _ext in ("*.yml", "*.yaml", "*.json"):
-            _found = sorted(_glob.glob(os.path.join(STYLETTS2_MODEL_DIR, "**/" + _ext), recursive=True))
-            if _found:
-                _config = _found[0]
-                break
-
-    print(f"[TTS] Model dir contents:")
-    for _f in sorted(_glob.glob(os.path.join(STYLETTS2_MODEL_DIR, "*"))):
-        print(f"[TTS]   {_f}")
-
-    if _ckpt and _config:
-        print(f"[TTS] pip package | ckpt={_ckpt}")
-        print(f"[TTS] pip package | config={_config}")
-        styletts2_model = StyleTTS2Module.StyleTTS2(
-            model_checkpoint_path=_ckpt,
-            config_path=_config,
-        )
-        _tts_method = "pip"
-    else:
-        raise FileNotFoundError(f"No model/config found in {STYLETTS2_MODEL_DIR}")
-except Exception as e1:
-    print(f"[TTS] pip package failed: {e1}")
-    try:
-        if STYLETTS2_MODEL_DIR not in sys.path:
-            sys.path.insert(0, STYLETTS2_MODEL_DIR)
-        from inference import StyleTTS2 as LocalStyleTTS2
-        styletts2_model = LocalStyleTTS2(config_path=_config, models_path=_ckpt).eval().to(DEVICE)
-        _tts_method = "local"
-        print(f"[TTS] Using local inference.py from {STYLETTS2_MODEL_DIR}")
-    except Exception as e2:
-        print(f"[TTS] local inference.py also failed: {e2}")
-        import traceback
-        traceback.print_exc()
-        print("[TTS] WARNING: TTS unavailable — audio responses will be empty")
-
-if styletts2_model:
-    print(f"[TTS] Loaded via '{_tts_method}' in {time.time()-t0:.1f}s")
-
-# Auto-detect reference audio
-_tts_ref_audio_path = STYLETTS2_REF_AUDIO
-if not _tts_ref_audio_path:
-    import glob as _glob2
-    _ref_candidates = sorted(_glob2.glob(os.path.join(STYLETTS2_MODEL_DIR, "reference_audio", "vn_*.wav")))
-    if not _ref_candidates:
-        _ref_candidates = sorted(_glob2.glob(os.path.join(STYLETTS2_MODEL_DIR, "reference_audio", "*.wav")))
-    if _ref_candidates:
-        _tts_ref_audio_path = _ref_candidates[0]
-        print(f"[TTS] Reference audio: {_tts_ref_audio_path}")
-    else:
-        print("[TTS] No reference audio found")
-
-# Precompute styles
-_tts_styles = None
-if styletts2_model and _tts_method == "local" and _tts_ref_audio_path:
-    try:
-        _speakers = {"id_1": {"path": _tts_ref_audio_path, "lang": "vi", "speed": 1.0}}
-        with torch.no_grad():
-            _tts_styles = styletts2_model.get_styles(_speakers, denoise=0.6, avg_style=True)
-        print(f"[TTS] Precomputed styles from {_tts_ref_audio_path}")
-    except Exception as e:
-        print(f"[TTS] Failed to precompute styles: {e}")
+    from f5_tts.api import F5TTS
+    f5_tts_model = F5TTS(
+        model="F5TTS_Base",
+        ckpt_file=F5_TTS_CKPT,
+        vocab_file=F5_TTS_VOCAB,
+        device=DEVICE,
+    )
+    print(f"[TTS] F5-TTS loaded in {time.time()-t0:.1f}s")
+except Exception as e:
+    print(f"[TTS] F5-TTS load failed: {e}")
+    import traceback
+    traceback.print_exc()
+    print("[TTS] WARNING: TTS unavailable — audio responses will be empty")
 
 # --- Noise Suppression ---
 df_model = None
@@ -200,10 +142,10 @@ _model_ctx = {
     "llm_client": llm_client,
     "llm_mode": LLM_MODE,
     "llm_model_name": LLM_MODEL,
-    "styletts2_model": styletts2_model,
-    "tts_method": _tts_method,
-    "tts_styles": _tts_styles,
-    "tts_ref_audio_path": _tts_ref_audio_path,
+    "f5_tts_model": f5_tts_model,
+    "f5_tts_ref_audio": F5_TTS_REF_AUDIO,
+    "f5_tts_ref_text": F5_TTS_REF_TEXT,
+    "f5_tts_speed": F5_TTS_SPEED,
     "tts_sample_rate": TTS_SAMPLE_RATE,
     "df_model": df_model,
     "df_state": df_state,
@@ -228,17 +170,19 @@ with torch.inference_mode():
     segments, _ = stt_model.transcribe(np.zeros(16000, dtype=np.float32), language="vi")
     list(segments)
 
-    if styletts2_model is not None:
+    if f5_tts_model is not None:
         try:
-            if _tts_method == "pip":
-                styletts2_model.inference("xin chào",
-                    alpha=STYLETTS2_ALPHA, beta=STYLETTS2_BETA,
-                    diffusion_steps=STYLETTS2_DIFFUSION_STEPS, embedding_scale=1)
-            elif _tts_styles:
-                styletts2_model.generate("xin chào", _tts_styles)
+            handlers.tts_synthesize("xin chào")
             print(f"[TTS] Warmup OK")
         except Exception as e:
             print(f"[TTS] Warmup failed: {e}")
+
+    # Pre-synthesize backchannel clips
+    if f5_tts_model is not None:
+        try:
+            handlers.pre_synthesize_backchannels()
+        except Exception as e:
+            print(f"[BC] Backchannel pre-synthesis failed: {e}")
 
     if llm_model:
         _warmup_text = llm_tokenizer.apply_chat_template(
@@ -280,11 +224,11 @@ def health():
             "stt": WHISPER_MODEL_SIZE,
             "llm": LLM_MODEL,
             "tts": {
-                "engine": "StyleTTS2-lite-vi",
-                "method": _tts_method,
-                "model_dir": STYLETTS2_MODEL_DIR,
+                "engine": "F5-TTS-Vietnamese-ViVoice",
+                "ckpt": F5_TTS_CKPT,
+                "vocab": F5_TTS_VOCAB,
+                "ref_audio": F5_TTS_REF_AUDIO,
                 "sample_rate": TTS_SAMPLE_RATE,
-                "diffusion_steps": STYLETTS2_DIFFUSION_STEPS,
             },
         }
     })
@@ -357,6 +301,42 @@ def stt_only():
 
 
 # ============================================================
+# Metrics dashboard
+# ============================================================
+
+@app.route("/metrics/dashboard", methods=["GET"])
+def metrics_dashboard():
+    """Quality metrics dashboard — tổng hợp STT/LLM/TTS quality."""
+    try:
+        from quality_metrics import summarize_metrics
+        last_n = request.args.get("last", 100, type=int)
+        metrics_file = os.environ.get("METRICS_FILE", "/workspace/voicebot-pipeline/call_metrics.jsonl")
+        summary = summarize_metrics(metrics_file, last_n=last_n)
+        return jsonify(summary)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/metrics/wer", methods=["POST"])
+def metrics_wer():
+    """Tính WER giữa ground truth và STT output.
+    POST {"reference": "tôi muốn đặt lịch", "hypothesis": "tôi muốn đặt lệch"}
+    """
+    try:
+        from quality_metrics import compute_wer
+        data = request.json or {}
+        ref = data.get("reference", "")
+        hyp = data.get("hypothesis", "")
+        if not ref:
+            return jsonify({"error": "Missing reference"}), 400
+        wer = compute_wer(ref, hyp)
+        grade = "good" if wer < 0.05 else "ok" if wer < 0.1 else "poor" if wer < 0.15 else "bad"
+        return jsonify({"wer": wer, "grade": grade, "reference": ref, "hypothesis": hyp})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================
 # WebSocket endpoint
 # ============================================================
 
@@ -417,6 +397,7 @@ try:
                     process_thread.start()
                     audio_data = None
 
+        handlers._cleanup_session(ws)
         print("[WS] Client disconnected")
 
     print("[WS] WebSocket endpoint enabled at /ws")
@@ -427,3 +408,4 @@ except ImportError:
 if __name__ == "__main__":
     print(f"[SERVER] Starting on port {PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+

@@ -43,4 +43,14 @@ ENV PORT=5300 \
     F5_TTS_REPO_DIR=/opt/F5-TTS-Vietnamese \
     ENABLE_DEEPFILTER=0
 
+# --- Auto-start: wrap RunPod's /start.sh to launch voicebot too ---
+# RunPod base image has /start.sh that starts Jupyter + SSH.
+# We rename it, create a new /start.sh that starts voicebot in background
+# THEN runs RunPod's original start → Jupyter + SSH still work.
+RUN if [ -f /start.sh ]; then \
+      mv /start.sh /start_runpod.sh && \
+      printf '#!/bin/bash\nmkdir -p /workspace/voicebot-pipeline\nnohup bash /app/start.sh >> /workspace/voicebot-pipeline/server.log 2>&1 &\nexec /start_runpod.sh "$@"\n' > /start.sh && \
+      chmod +x /start.sh; \
+    fi
+
 EXPOSE 5300

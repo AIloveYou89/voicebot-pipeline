@@ -22,8 +22,10 @@ RUN npm install -g @anthropic-ai/claude-code
 # --- Python deps (cached layer) ---
 WORKDIR /app
 COPY constraints.txt requirements.txt ./
-RUN pip install --no-cache-dir -c constraints.txt -r requirements.txt \
-    transformers accelerate huggingface_hub
+# Force-remove distutils-installed blinker 1.4 (can't pip uninstall)
+RUN rm -rf /usr/lib/python3/dist-packages/blinker* \
+    && pip install --no-cache-dir -c constraints.txt -r requirements.txt \
+       transformers accelerate huggingface_hub
 
 # --- F5-TTS Vietnamese (local fork — editable install) ---
 RUN git clone https://github.com/nguyenthienhy/F5-TTS-Vietnamese /opt/F5-TTS-Vietnamese \

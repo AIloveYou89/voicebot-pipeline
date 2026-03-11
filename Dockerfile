@@ -31,8 +31,12 @@ RUN rm -rf /usr/lib/python3/dist-packages/blinker* \
 RUN git clone https://github.com/nguyenthienhy/F5-TTS-Vietnamese /opt/F5-TTS-Vietnamese \
     && pip install --no-cache-dir -e /opt/F5-TTS-Vietnamese
 
-# --- DeepFilterNet noise suppression (optional — fail OK) ---
-RUN pip install --no-cache-dir deepfilternet 2>/dev/null || echo "DeepFilterNet skipped"
+# --- Rust toolchain (needed by DeepFilterNet) ---
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# --- DeepFilterNet noise suppression ---
+RUN pip install --no-cache-dir deepfilternet || echo "DeepFilterNet skipped"
 
 # --- App code (fallback if /workspace not mounted) ---
 COPY all_in_one_server.py handlers.py tools.py quality_metrics.py start.sh ./

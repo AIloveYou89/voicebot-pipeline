@@ -976,12 +976,12 @@ def _agent_step(messages, round_i=0, session_state=None):
 # Streaming agent: state-machine parser + smart sentence detector
 # ============================================================
 
-# Known Qwen special tokens to strip (but NOT <tool_call>/<tool_call>)
+# Special tokens to strip from local LLM output (keep <tool_call> tags)
 _SPECIAL_TOKEN_RE = re.compile(r'<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>')
 
 
 def _clean_special_tokens(text):
-    """Strip Qwen special tokens but keep <tool_call> tags."""
+    """Strip special tokens but keep <tool_call> tags. Only used for local LLM."""
     return _SPECIAL_TOKEN_RE.sub('', text)
 
 
@@ -1618,12 +1618,12 @@ def _enrich_tool_args(name, args, state):
 
 
 def llm_generate_stream(user_text, conversation=None, session_state=None, cancel_event=None):
-    """Stream LLM tokens — routes to local Qwen or Groq API based on llm_mode.
+    """Stream LLM tokens — routes to Groq API or local model based on llm_mode.
 
     Groq mode: tokens arrive via network → GPU free for TTS → true parallel pipeline.
     Local mode: tokens from GPU → must serialize with TTS (single GPU contention).
     """
-    llm_mode = _ctx.get("llm_mode", "local")
+    llm_mode = _ctx.get("llm_mode", "groq")
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
@@ -1639,22 +1639,24 @@ def llm_generate_stream(user_text, conversation=None, session_state=None, cancel
 
     if llm_mode == "groq":
         # Groq API — streaming agent with tool support
-        # Auto-inject tool results for faster response
         if ENABLE_TOOLS:
             _auto_inject_tools(user_text, messages)
         yield from _groq_agent_step(messages, session_state=session_state, cancel_event=cancel_event)
         return
 
-    # Local Qwen model
-    if not ENABLE_TOOLS:
-        yield from _llm_generate_once(messages, stream=True)
+    if llm_mode == "local" and _ctx.get("llm_model") is not None:
+        # Local model — must serialize with TTS on same GPU
+        if not ENABLE_TOOLS:
+            yield from _llm_generate_once(messages, stream=True)
+            return
+        _auto_inject_tools(user_text, messages)
+        yield from _streaming_agent_step(messages, session_state=session_state, cancel_event=cancel_event)
         return
 
-    # Auto-inject tool results based on intent detection
-    _auto_inject_tools(user_text, messages)
-
-    # Streaming agent — yields text chunks, handles tool calls inline
-    yield from _streaming_agent_step(messages, session_state=session_state, cancel_event=cancel_event)
+    # Fallback: API mode (OpenAI) — non-streaming, wrap as single yield
+    reply = llm_generate_api(user_text, conversation)
+    if reply:
+        yield reply
 
 
 def llm_generate_api(user_text, conversation=None):
@@ -1820,7 +1822,7 @@ def chat_streaming_pipeline(transcript, conversation=None, session_state=None):
 def handle_chat(audio_b64, conversation):
     """Handle /chat request. Returns (response_dict, status_code)."""
     global _muted
-    llm_mode = _ctx.get("llm_mode", "local")
+    llm_mode = _ctx.get("llm_mode", "groq")
     llm_model = _ctx.get("llm_model")
     tts_sample_rate = _ctx.get("tts_sample_rate", 24000)
     session = _new_session_state()  # temp session per HTTP request
@@ -1863,7 +1865,7 @@ def handle_chat(audio_b64, conversation):
 
     # LLM + TTS
     try:
-        if llm_mode in ("local", "groq"):
+        if llm_mode == "groq" or (llm_mode == "local" and _ctx.get("llm_model") is not None):
             reply, wav_bytes, latency = chat_streaming_pipeline(transcript, conversation, session_state=session)
             llm_time = latency["llm"]
             tts_time = latency["tts"]
@@ -1940,7 +1942,7 @@ def handle_ws_process(ws, audio_bytes, conversation, cancel_event=None, turn_id=
     """
     import struct
     global _muted
-    llm_mode = _ctx.get("llm_mode", "local")
+    llm_mode = _ctx.get("llm_mode", "groq")
     llm_model = _ctx.get("llm_model")
     session = _get_session(ws)
 

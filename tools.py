@@ -1,5 +1,5 @@
 """
-Agent Tools cho Voicebot LLM — Qwen2.5 Function Calling
+Agent Tools cho Voicebot LLM — OpenAI-compatible Function Calling
 Mỗi tool có: schema (JSON) + executor (Python function)
 
 Cách thêm tool mới:
@@ -263,7 +263,7 @@ def tool_book_appointment(args):
 
 
 # ============================================================
-# Tool Schemas (OpenAI-compatible format, Qwen2.5 supports)
+# Tool Schemas (OpenAI-compatible format — works with Groq, OpenAI, Qwen)
 # ============================================================
 
 TOOL_SCHEMAS = [

@@ -209,7 +209,7 @@ with torch.inference_mode():
         except Exception as e:
             print(f"[BC] Backchannel pre-synthesis failed: {e}")
 
-    if llm_model:
+    if llm_model and llm_tokenizer:
         _warmup_text = llm_tokenizer.apply_chat_template(
             [{"role": "system", "content": handlers.SYSTEM_PROMPT},
              {"role": "user", "content": "xin chao"}],

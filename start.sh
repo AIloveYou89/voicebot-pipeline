@@ -28,12 +28,17 @@ cd /workspace/voicebot-pipeline
 export PORT="${PORT:-5300}"
 
 # --- Load Groq API key ---
+export LLM_MODE="${LLM_MODE:-groq}"
 GROQ_KEY_FILE="/workspace/voicebot-pipeline/groqapi.txt"
 if [ -z "${GROQ_API_KEY:-}" ] && [ -f "$GROQ_KEY_FILE" ]; then
     export GROQ_API_KEY=$(grep 'GROQ_API_KEY=' "$GROQ_KEY_FILE" | cut -d'=' -f2)
     echo "[SETUP] Loaded GROQ_API_KEY from $GROQ_KEY_FILE"
 fi
-export LLM_MODE="${LLM_MODE:-groq}"
+if [ "$LLM_MODE" = "groq" ] && [ -z "${GROQ_API_KEY:-}" ]; then
+    echo "[ERROR] LLM_MODE=groq but GROQ_API_KEY not set!" | tee -a "$LOG_FILE"
+    echo "[ERROR] Set GROQ_API_KEY env var or create $GROQ_KEY_FILE" | tee -a "$LOG_FILE"
+    exit 1
+fi
 VENV_DIR="/workspace/voicebot-pipeline/.venv"
 REQ_HASH_FILE="$VENV_DIR/.req_hash"
 F5TTS_MARKER="$VENV_DIR/.f5tts_installed"

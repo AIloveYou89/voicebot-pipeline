@@ -45,7 +45,7 @@ RUN chmod +x start.sh
 # --- Env defaults ---
 ENV PORT=5300 \
     LLM_MODE=local \
-    LLM_MODEL=Qwen/Qwen2.5-3B-Instruct \
+    LLM_MODEL=Qwen/Qwen2.5-7B-Instruct \
     F5_TTS_REPO_DIR=/opt/F5-TTS-Vietnamese \
     ENABLE_DEEPFILTER=0
 

@@ -1,62 +1,62 @@
 # ============================================================
-# Voicebot All-in-One — Docker Image (deps + tools only)
-# Models: network volume /workspace (NOT baked into image)
-# Claude Code: pre-installed for on-pod editing
+# Voicebot All-in-One — Docker Image
+# Pre-bakes: OS deps, pip packages, model weights
+# Runtime: load models vào GPU (~30s thay vì ~5min download+load)
+#
 # Image: ghcr.io/ailoveyou89/voicebot-pipeline:latest
+#
+# LLM modes:
+#   LLM_MODE=groq  → Groq API (recommended, no GPU contention)
+#   LLM_MODE=local → Qwen2.5 on GPU (needs more VRAM)
 # ============================================================
 
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
+
+WORKDIR /app
 
 # --- OS deps ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsndfile1 ffmpeg git curl xz-utils \
+    libsndfile1 ffmpeg git \
     && rm -rf /var/lib/apt/lists/*
 
-# --- Node.js 20 (direct binary — nodesource fails in some DCs) ---
-RUN curl -fsSL https://nodejs.org/dist/v20.18.2/node-v20.18.2-linux-x64.tar.xz \
-    | tar -xJ -C /usr/local --strip-components=1
-
-# --- Claude Code (for editing on pod) ---
-RUN npm install -g @anthropic-ai/claude-code
-
 # --- Python deps (cached layer) ---
-WORKDIR /app
 COPY constraints.txt requirements.txt ./
-# Force-remove distutils-installed blinker 1.4 (can't pip uninstall)
-RUN rm -rf /usr/lib/python3/dist-packages/blinker* \
-    && pip install --no-cache-dir -c constraints.txt -r requirements.txt \
-       transformers accelerate huggingface_hub
+RUN pip install --no-cache-dir \
+    -c constraints.txt \
+    -r requirements.txt \
+    transformers accelerate huggingface_hub
 
-# --- F5-TTS Vietnamese (local fork — editable install) ---
-RUN git clone https://github.com/nguyenthienhy/F5-TTS-Vietnamese /opt/F5-TTS-Vietnamese \
-    && pip install --no-cache-dir -e /opt/F5-TTS-Vietnamese
+# --- F5-TTS Vietnamese (local fork) ---
+RUN git clone https://github.com/nguyenthienhy/F5-TTS-Vietnamese /app/F5-TTS-Vietnamese \
+    && pip install --no-cache-dir -e /app/F5-TTS-Vietnamese
 
-# --- Rust toolchain (needed by DeepFilterNet) ---
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
+# --- Download models into image ---
+# STT: Faster-Whisper large-v3 (~3GB)
+RUN python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', device='cpu', compute_type='int8')"
 
-# --- DeepFilterNet noise suppression ---
-RUN pip install --no-cache-dir deepfilternet || echo "DeepFilterNet skipped"
+# TTS: F5-TTS-Vietnamese-ViVoice (~5GB)
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('hynt/F5-TTS-Vietnamese-ViVoice', local_dir='/app/F5-TTS-Vietnamese-ViVoice')" \
+    && mv /app/F5-TTS-Vietnamese-ViVoice/config.json /app/F5-TTS-Vietnamese-ViVoice/vocab.txt
 
-# --- App code (fallback if /workspace not mounted) ---
-COPY all_in_one_server.py handlers.py tools.py quality_metrics.py start.sh ./
-RUN chmod +x start.sh
+# --- Copy app code (small layer — fast rebuild on code changes) ---
+COPY all_in_one_server.py handlers.py tools.py quality_metrics.py voice_web.py requirements.txt start.sh ./
 
-# --- Env defaults ---
+# --- Env defaults (Groq mode — no local LLM needed) ---
 ENV PORT=5300 \
-    LLM_MODE=local \
-    LLM_MODEL=Qwen/Qwen2.5-7B-Instruct \
-    F5_TTS_REPO_DIR=/opt/F5-TTS-Vietnamese \
+    LLM_MODE=groq \
+    GROQ_MODEL=llama-3.3-70b-versatile \
+    F5_TTS_REPO_DIR=/app/F5-TTS-Vietnamese \
+    F5_TTS_CKPT=/app/F5-TTS-Vietnamese-ViVoice/model_last.pt \
+    F5_TTS_VOCAB=/app/F5-TTS-Vietnamese/vocab.txt \
+    F5_TTS_REF_AUDIO=/app/F5-TTS-Vietnamese/ref.wav \
+    F5_TTS_REF_TEXT="cả hai bên hãy cố gắng hiểu cho nhau" \
     ENABLE_DEEPFILTER=0
 
-# --- Auto-start: wrap RunPod's /start.sh to launch voicebot too ---
-# RunPod base image has /start.sh that starts Jupyter + SSH.
-# We rename it, create a new /start.sh that starts voicebot in background
-# THEN runs RunPod's original start → Jupyter + SSH still work.
-RUN if [ -f /start.sh ]; then \
-      mv /start.sh /start_runpod.sh && \
-      printf '#!/bin/bash\nmkdir -p /workspace/voicebot-pipeline\nnohup bash /app/start.sh >> /workspace/voicebot-pipeline/server.log 2>&1 &\nexec /start_runpod.sh "$@"\n' > /start.sh && \
-      chmod +x /start.sh; \
-    fi
+# GROQ_API_KEY must be set at runtime:
+#   docker run -e GROQ_API_KEY=gsk_xxx ...
+# Or for local LLM mode:
+#   docker run -e LLM_MODE=local -e LLM_MODEL=Qwen/Qwen2.5-3B-Instruct ...
 
 EXPOSE 5300
+
+CMD ["python", "-u", "all_in_one_server.py"]

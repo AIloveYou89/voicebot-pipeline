@@ -125,8 +125,9 @@ const POD_URL = '{{POD_URL}}';
 const SPEECH_THRESHOLD = 30;          // Volume threshold khi idle (listening)
 const BARGEIN_THRESHOLD = 45;         // Volume threshold khi đang phát audio (cao hơn để tránh false trigger)
 const BARGEIN_SUSTAIN_FRAMES = 8;     // Phải vượt threshold liên tục N frames (~130ms) mới barge-in
-const SILENCE_TIMEOUT = 150;          // ms silence before sending
-const MIN_SPEECH_MS = 200;
+const IDLE_SUSTAIN_FRAMES = 3;        // Phải vượt threshold 3 frames liên tục (~50ms) mới bắt đầu record (tránh noise blip)
+const SILENCE_TIMEOUT = 300;          // ms silence before sending (tăng từ 150 để tránh gửi clip quá ngắn)
+const MIN_SPEECH_MS = 300;
 const SPEECH_FREQ_LOW = 300;          // Hz — giọng nói bắt đầu từ ~300Hz
 const SPEECH_FREQ_HIGH = 3500;        // Hz — giọng nói chủ yếu dưới 3500Hz
 
@@ -259,6 +260,11 @@ function handleServerMessage(msg) {
             waitForPlaybackDone();
             break;
         }
+        case 'ignored':
+            // Server ignored this audio (noise, empty transcript, low SNR)
+            isAwaitingResponse = false;
+            if (autoMode.checked) setStatus('listening', 'Listening...');
+            break;
         case 'error':
             if (msg.error !== 'Empty transcript') setStatus('error', msg.error);
             isAwaitingResponse = false;
@@ -439,10 +445,13 @@ function startVAD() {
                     speechFrameCount = 0;
                 }
             } else if (isIdle) {
-                // Idle mode: start recording immediately
-                startRecording();
-                speechStart = Date.now();
-                speechFrameCount = 0;
+                // Idle mode: require a few sustained frames to avoid noise blips
+                speechFrameCount++;
+                if (speechFrameCount >= IDLE_SUSTAIN_FRAMES) {
+                    startRecording();
+                    speechStart = Date.now();
+                    speechFrameCount = 0;
+                }
             }
             // If isAwaitingResponse && !isPlaying → do nothing (wait for server)
 
@@ -600,6 +609,7 @@ function addMsg(role, text, latency, metrics) {
     let html = (role === 'user' ? '&#127908; ' : '&#129302; ') + escapeHtml(text);
     if (latency) {
         let metaStr = 'STT ' + latency.stt + 's | LLM ' + latency.llm + 's | TTS ' + latency.tts + 's | Total ' + latency.total + 's';
+        if (latency.first_audio != null) metaStr += ' | 1st audio ' + latency.first_audio + 's';
         if (metrics) {
             if (metrics.input_snr != null) metaStr += ' | SNR ' + metrics.input_snr + 'dB';
             if (metrics.stt_confidence != null) metaStr += ' | Conf ' + metrics.stt_confidence;

@@ -16,7 +16,7 @@ server_restart*.log
 .claude/
 
 # Models (too large for git — baked into Docker image)
-styletts2_lite_vi/
+F5-TTS-Vietnamese-ViVoice/
 *.pth
 *.pt
 *.safetensors
@@ -26,5 +26,7 @@ styletts2_lite_vi/
 *.wav
 !prompts/consent_audio.wav
 
-# Env
+# Env & secrets
 .env
+groqapi.txt
+*apikey*

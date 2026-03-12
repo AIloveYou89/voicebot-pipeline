@@ -1,8 +1,8 @@
 """
-All-in-One Voice Server — STT + LLM + TTS tren 1 GPU
-  STT: Faster-Whisper large-v3
-  LLM: Qwen2.5-7B-Instruct (local GPU) hoac GPT-4o-mini (API fallback)
-  TTS: F5-TTS-Vietnamese-ViVoice
+All-in-One Voice Server — STT + LLM + TTS
+  STT: Faster-Whisper large-v3 (GPU)
+  LLM: Groq API (default) hoặc local Qwen (fallback)
+  TTS: F5-TTS-Vietnamese-ViVoice (GPU)
   Hot-reload: POST /reload to reload handlers.py without restarting models
 
 This file: model loading + Flask routes (NOT reloadable)
@@ -33,9 +33,11 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "large-v3")
 
 # LLM
-LLM_MODE = os.environ.get("LLM_MODE", "local")
-LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+LLM_MODE = os.environ.get("LLM_MODE", "groq")  # "groq", "local", "api"
+LLM_MODEL = os.environ.get("LLM_MODEL", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 # TTS (F5-TTS)
 F5_TTS_REPO_DIR = os.environ.get("F5_TTS_REPO_DIR", "/workspace/F5-TTS-Vietnamese")
@@ -70,7 +72,20 @@ llm_model = None
 llm_tokenizer = None
 llm_client = None
 
-if LLM_MODE == "local":
+if LLM_MODE == "groq":
+    LLM_MODEL = GROQ_MODEL
+    if not GROQ_API_KEY:
+        print("[LLM] FATAL: GROQ_API_KEY not set! Get one at https://console.groq.com/keys")
+        sys.exit(1)
+    print(f"[LLM] Using {GROQ_MODEL} via Groq API (GPU free for TTS!)")
+    from openai import OpenAI as _OpenAI
+    llm_client = _OpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+    )
+elif LLM_MODE == "local":
+    if not LLM_MODEL:
+        LLM_MODEL = "Qwen/Qwen2.5-3B-Instruct"
     print(f"[LLM] Loading {LLM_MODEL} on GPU...")
     t0 = time.time()
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -83,6 +98,8 @@ if LLM_MODE == "local":
     )
     print(f"[LLM] Loaded in {time.time()-t0:.1f}s")
 else:
+    if not LLM_MODEL:
+        LLM_MODEL = "gpt-4o-mini"
     print(f"[LLM] Using {LLM_MODEL} via OpenAI API")
     from openai import OpenAI
     llm_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -174,6 +191,14 @@ with torch.inference_mode():
         try:
             handlers.tts_synthesize("xin chào")
             print(f"[TTS] Warmup OK")
+            # Cache reference audio to avoid reloading from disk on every TTS call
+            try:
+                import torchaudio
+                ref_wav, ref_sr = torchaudio.load(F5_TTS_REF_AUDIO)
+                _model_ctx["f5_tts_ref_audio_cached"] = (ref_wav, ref_sr)
+                print(f"[TTS] Reference audio cached: {F5_TTS_REF_AUDIO} ({ref_sr}Hz)")
+            except Exception as cache_e:
+                print(f"[TTS] Ref audio cache skipped: {cache_e}")
         except Exception as e:
             print(f"[TTS] Warmup failed: {e}")
 

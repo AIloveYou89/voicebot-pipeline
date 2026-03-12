@@ -16,6 +16,7 @@ import random
 import threading
 from math import gcd
 from datetime import datetime, timezone
+from enum import Enum, auto
 
 import torch
 import numpy as np
@@ -64,7 +65,7 @@ def init(ctx):
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "200"))
 LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.5"))
 SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT",
-    "Bạn là nhân viên telesale đặt lịch hẹn qua điện thoại cho công ty. "
+    "Bạn là nhân viên đặt lịch hẹn qua điện thoại cho công ty. KHÔNG BAO GIỜ dùng từ 'telesale' hay 'telesales'. "
     "CHỈ nói tiếng Việt. TUYỆT ĐỐI KHÔNG dùng tiếng Trung Quốc, tiếng Anh, hay bất kỳ ngôn ngữ nào khác. "
     "TUYỆT ĐỐI KHÔNG dùng ký tự Trung Quốc (Hán tự). Chỉ dùng chữ Việt có dấu. "
     "KHÔNG BAO GIỜ nói: 'hẹn gặp lại', 'subscribe', 'video', 'kênh', 'like share', 'đăng ký'. "
@@ -817,8 +818,10 @@ ENABLE_TOOLS = os.environ.get("ENABLE_TOOLS", "1") == "1"
 MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "3"))
 
 
-def _llm_generate_once(messages, stream=False):
-    """Single LLM generation round. Returns full text or yields tokens if stream=True."""
+def _llm_generate_once(messages, stream=False, skip_special=True):
+    """Single LLM generation round. Returns full text or yields tokens if stream=True.
+    skip_special=False keeps <tool_call> tags in stream (needed for streaming agent).
+    """
     from transformers import TextIteratorStreamer
 
     llm_model = _ctx["llm_model"]
@@ -846,7 +849,10 @@ def _llm_generate_once(messages, stream=False):
 
     if stream:
         # Streaming mode — use TextIteratorStreamer in a thread
-        streamer = TextIteratorStreamer(llm_tokenizer, skip_prompt=True, skip_special_tokens=True)
+        streamer = TextIteratorStreamer(
+            llm_tokenizer, skip_prompt=True,
+            skip_special_tokens=skip_special,
+        )
         gen_kwargs["streamer"] = streamer
         gen_error = [None]
 
@@ -964,6 +970,459 @@ def _agent_step(messages, round_i=0, session_state=None):
 
     # Recurse — let LLM use tool result to write natural response
     return _agent_step(messages, round_i + 1, session_state=session_state)
+
+
+# ============================================================
+# Streaming agent: state-machine parser + smart sentence detector
+# ============================================================
+
+# Known Qwen special tokens to strip (but NOT <tool_call>/<tool_call>)
+_SPECIAL_TOKEN_RE = re.compile(r'<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>')
+
+
+def _clean_special_tokens(text):
+    """Strip Qwen special tokens but keep <tool_call> tags."""
+    return _SPECIAL_TOKEN_RE.sub('', text)
+
+
+class _StreamParserState(Enum):
+    TEXT = auto()       # Normal text output
+    TOOL_TAG = auto()   # Accumulating potential <tool_call> tag
+    TOOL_JSON = auto()  # Inside tool call JSON body
+
+
+_FILLER_TEXTS = [
+    "Dạ, để em kiểm tra nhé.",
+    "Dạ, em xem ngay ạ.",
+    "Một chút nhé.",
+]
+
+
+# ============================================================
+# Groq API streaming LLM (offload LLM to Groq, GPU free for TTS)
+# ============================================================
+
+def _llm_generate_groq_stream(messages, tools=None):
+    """Stream tokens from Groq API. Yields (delta_text, tool_calls_list, finish_reason).
+
+    - delta_text: text token or None
+    - tool_calls_list: completed tool calls list or None
+    - finish_reason: "stop", "tool_calls", or None (still streaming)
+    """
+    client = _ctx["llm_client"]
+    model = _ctx["llm_model_name"]
+
+    kwargs = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": LLM_MAX_TOKENS,
+        "temperature": LLM_TEMPERATURE,
+        "stream": True,
+    }
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "auto"
+
+    response = client.chat.completions.create(**kwargs)
+
+    # Accumulate tool call deltas
+    tool_call_acc = {}  # index -> {id, name, arguments_str}
+
+    for chunk in response:
+        choice = chunk.choices[0] if chunk.choices else None
+        if choice is None:
+            continue
+
+        delta = choice.delta
+        finish = choice.finish_reason
+
+        # Text content
+        if delta and delta.content:
+            yield delta.content, None, None
+
+        # Tool call deltas
+        if delta and delta.tool_calls:
+            for tc_delta in delta.tool_calls:
+                idx = tc_delta.index
+                if idx not in tool_call_acc:
+                    tool_call_acc[idx] = {
+                        "id": tc_delta.id or "",
+                        "name": (tc_delta.function.name if tc_delta.function else "") or "",
+                        "arguments": "",
+                    }
+                else:
+                    if tc_delta.id:
+                        tool_call_acc[idx]["id"] = tc_delta.id
+                    if tc_delta.function and tc_delta.function.name:
+                        tool_call_acc[idx]["name"] = tc_delta.function.name
+                if tc_delta.function and tc_delta.function.arguments:
+                    tool_call_acc[idx]["arguments"] += tc_delta.function.arguments
+
+        # Finish
+        if finish == "tool_calls" and tool_call_acc:
+            calls = []
+            for idx in sorted(tool_call_acc.keys()):
+                tc = tool_call_acc[idx]
+                try:
+                    args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                except json.JSONDecodeError:
+                    args = {}
+                calls.append((tc["id"], tc["name"], args))
+            yield None, calls, "tool_calls"
+            return
+        elif finish == "stop":
+            yield None, None, "stop"
+            return
+
+
+def _groq_agent_step(messages, session_state=None, cancel_event=None):
+    """Streaming agent for Groq API. Yields sentences as they complete.
+
+    Unlike local LLM, Groq runs on remote server — NO GPU contention.
+    So we can yield sentences as soon as detected → TTS starts immediately
+    while more tokens still arrive from Groq. TRUE PARALLEL.
+    """
+    tools = TOOL_SCHEMAS if ENABLE_TOOLS else None
+
+    for round_i in range(MAX_TOOL_ROUNDS + 1):
+        if cancel_event and cancel_event.is_set():
+            return
+
+        if round_i >= MAX_TOOL_ROUNDS:
+            print(f"[GROQ-AGENT] Max rounds ({MAX_TOOL_ROUNDS}) reached")
+            yield "Dạ, em xin lỗi, hệ thống đang bận. Anh chị thử lại sau ạ."
+            return
+
+        print(f"[GROQ-AGENT] Round {round_i}: starting Groq stream")
+        llm_t0 = time.time()
+        sentence_buffer = ""
+        full_text = ""
+        tool_calls = None
+        got_finish = False
+
+        for delta_text, tc_list, finish in _llm_generate_groq_stream(messages, tools=tools):
+            if cancel_event and cancel_event.is_set():
+                return
+
+            if delta_text:
+                sentence_buffer += delta_text
+                full_text += delta_text
+
+                # Check for sentence boundary — yield immediately for TTS
+                should_flush, reason = _should_flush_sentence(sentence_buffer)
+                if should_flush and reason == "force_flush":
+                    # Force flush: split at last word boundary, keep trailing punct
+                    # to avoid orphan "." chunks
+                    words = sentence_buffer.strip().split()
+                    yield " ".join(words)
+                    sentence_buffer = ""
+                elif should_flush:
+                    sentence = sentence_buffer.strip()
+                    if sentence:
+                        yield sentence
+                    sentence_buffer = ""
+
+            if tc_list is not None:
+                tool_calls = tc_list
+                got_finish = True
+                break
+
+            if finish == "stop":
+                got_finish = True
+                break
+
+        llm_elapsed = time.time() - llm_t0
+        print(f"[GROQ-AGENT] Round {round_i}: done in {llm_elapsed*1000:.0f}ms, {len(full_text)} chars")
+
+        # Flush remaining buffer
+        remainder = sentence_buffer.strip()
+        if remainder:
+            yield remainder
+
+        if not tool_calls:
+            # No tool call — done
+            print(f"[GROQ-AGENT] Round {round_i}: no tool, text='{full_text[:80]}'")
+            return
+
+        # Tool call — yield filler, execute, then next round
+        # Text before tool call already yielded above
+        filler = random.choice(_FILLER_TEXTS)
+        print(f"[GROQ-AGENT] Round {round_i}: filler: '{filler}'")
+        yield filler
+
+        # Build assistant message with tool_calls for API format
+        assistant_msg = {"role": "assistant", "content": full_text or None}
+        assistant_msg["tool_calls"] = [
+            {
+                "id": tc_id,
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+            }
+            for tc_id, name, args in tool_calls
+        ]
+        messages.append(assistant_msg)
+
+        # Execute tools and add results
+        for tc_id, name, args in tool_calls:
+            if session_state:
+                args = _enrich_tool_args(name, args, session_state)
+            print(f"[GROQ-AGENT] Executing tool '{name}' args={args}")
+            result = execute_tool(name, args)
+            if session_state:
+                _extract_session_info(None, None, session_state, tool_args=args)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            })
+
+        print(f"[GROQ-AGENT] Round {round_i} done, next round with tool result")
+
+
+def _streaming_agent_step(messages, session_state=None, cancel_event=None):
+    """Generator: collects full LLM output per round, yields sentences for TTS.
+
+    IMPORTANT: On single-GPU (4090), LLM generate and F5-TTS CANNOT run concurrently.
+    model.generate() runs in a background thread (TextIteratorStreamer), so we MUST
+    consume ALL tokens before doing any TTS. Otherwise GPU contention → deadlock.
+
+    Strategy per round:
+      1. Collect ALL LLM tokens (let model.generate finish completely)
+      2. Parse for tool calls with state machine
+      3. If tool found: yield filler sentence → execute tool → next round
+      4. If no tool: split text into sentences → yield each sentence for TTS
+
+    The caller (handle_ws_process) does TTS after each yielded sentence,
+    which is safe because LLM generation is already complete.
+    """
+    for round_i in range(MAX_TOOL_ROUNDS + 1):
+        if cancel_event and cancel_event.is_set():
+            return
+
+        if round_i >= MAX_TOOL_ROUNDS:
+            print(f"[STREAM-AGENT] Max rounds ({MAX_TOOL_ROUNDS}) reached")
+            yield "Dạ, em xin lỗi, hệ thống đang bận. Anh chị thử lại sau ạ."
+            return
+
+        # --- Step 1: Collect ALL tokens from this LLM round ---
+        print(f"[STREAM-AGENT] Round {round_i}: starting LLM (skip_special=False)")
+        llm_t0 = time.time()
+        raw_output = ""
+        for token in _llm_generate_once(messages, stream=True, skip_special=False):
+            if cancel_event and cancel_event.is_set():
+                return
+            raw_output += token
+        llm_elapsed = time.time() - llm_t0
+        print(f"[STREAM-AGENT] Round {round_i}: LLM done in {llm_elapsed*1000:.0f}ms, {len(raw_output)} chars")
+
+        # --- Step 2: Parse with state machine ---
+        raw_output = _clean_special_tokens(raw_output)
+
+        state = _StreamParserState.TEXT
+        tag_buffer = ""
+        tool_buffer = ""
+        text_parts = []       # Clean text segments before tool calls
+        tool_calls_found = []  # List of (name, arguments) tuples
+        current_text = ""
+
+        for ch in raw_output:
+            if state == _StreamParserState.TEXT:
+                if ch == '<':
+                    tag_buffer = '<'
+                    state = _StreamParserState.TOOL_TAG
+                else:
+                    current_text += ch
+
+            elif state == _StreamParserState.TOOL_TAG:
+                tag_buffer += ch
+                if len(tag_buffer) <= len('<tool_call>'):
+                    if '<tool_call>'[:len(tag_buffer)] == tag_buffer:
+                        if tag_buffer == '<tool_call>':
+                            # Save text before tool call
+                            if current_text.strip():
+                                text_parts.append(current_text.strip())
+                                current_text = ""
+                            state = _StreamParserState.TOOL_JSON
+                            tool_buffer = ""
+                            tag_buffer = ""
+                    else:
+                        current_text += tag_buffer
+                        tag_buffer = ""
+                        state = _StreamParserState.TEXT
+                else:
+                    current_text += tag_buffer
+                    tag_buffer = ""
+                    state = _StreamParserState.TEXT
+
+            elif state == _StreamParserState.TOOL_JSON:
+                tool_buffer += ch
+                if tool_buffer.endswith('</tool_call>'):
+                    json_str = tool_buffer[:-len('</tool_call>')].strip()
+                    try:
+                        obj = json.loads(json_str)
+                        name = obj.get("name", "")
+                        arguments = obj.get("arguments", {})
+                        if name:
+                            tool_calls_found.append((name, arguments))
+                    except json.JSONDecodeError as e:
+                        print(f"[STREAM-AGENT] Tool JSON parse error: {e}")
+                    tool_buffer = ""
+                    state = _StreamParserState.TEXT
+
+        # Flush remaining
+        if state == _StreamParserState.TOOL_TAG:
+            current_text += tag_buffer
+        if current_text.strip():
+            cleaned = re.sub(r'</?tool_call>', '', current_text).strip()
+            if cleaned:
+                text_parts.append(cleaned)
+
+        # --- Step 3: Yield text and handle tool calls ---
+        if not tool_calls_found:
+            # No tool call — yield all text parts as sentences
+            full_text = " ".join(text_parts)
+            print(f"[STREAM-AGENT] Round {round_i}: no tool, text='{full_text[:80]}'")
+            if full_text:
+                yield full_text
+            return
+
+        # Tool call found — yield text before tool + filler, then execute
+        for part in text_parts:
+            if part:
+                print(f"[STREAM-AGENT] Round {round_i}: text before tool: '{part[:60]}'")
+                yield part
+
+        filler = random.choice(_FILLER_TEXTS)
+        print(f"[STREAM-AGENT] Round {round_i}: filler: '{filler}'")
+        yield filler
+
+        # Execute tools
+        messages.append({"role": "assistant", "content": raw_output})
+        for name, arguments in tool_calls_found:
+            if session_state:
+                arguments = _enrich_tool_args(name, arguments, session_state)
+            print(f"[STREAM-AGENT] Executing tool '{name}' args={arguments}")
+            result = execute_tool(name, arguments)
+            if session_state:
+                _extract_session_info(None, None, session_state, tool_args=arguments)
+            messages.append({
+                "role": "tool",
+                "name": name,
+                "content": json.dumps(result, ensure_ascii=False),
+            })
+
+        print(f"[STREAM-AGENT] Round {round_i} done, next round with tool result")
+
+
+# ============================================================
+# Smart sentence detector for streaming TTS
+# ============================================================
+
+# Sentence-end chars for flush detection
+_SENT_END_CHARS = set('.?!。!?')
+# Max words before force-flushing even without punctuation
+_FORCE_FLUSH_MAX_WORDS = 20
+# Min words to avoid too-short TTS chunks
+_MIN_FLUSH_WORDS = 2
+
+
+def _should_flush_sentence(buffer):
+    """Check if buffer should be flushed to TTS.
+
+    Priority:
+    1. Ends with .?! → flush
+    2. Contains newline → flush
+    3. >= 12 words → force flush
+    4. Otherwise → keep buffering
+
+    Returns (flush: bool, reason: str)
+    """
+    text = buffer.strip()
+    if not text:
+        return False, ""
+
+    words = text.split()
+    n_words = len(words)
+
+    if n_words < _MIN_FLUSH_WORDS:
+        return False, ""
+
+    last_char = text[-1]
+
+    # Rule 1: sentence end (.?!)
+    if last_char in _SENT_END_CHARS:
+        return True, "sentence_end"
+
+    # Rule 2: newline in buffer
+    if '\n' in buffer:
+        return True, "newline"
+
+    # Rule 3: force flush long buffer
+    if n_words >= _FORCE_FLUSH_MAX_WORDS:
+        return True, "force_flush"
+
+    return False, ""
+
+
+def _split_sentences_for_tts(text):
+    """Split text into TTS chunks. Simple rules, word boundaries only.
+
+    Priority:
+    1. Dấu chấm .
+    2. Dấu hỏi ?
+    3. Dấu chấm than !
+    4. Xuống dòng
+    5. Max words (force split)
+
+    Không split tại dấu phẩy, chấm phẩy, hai chấm.
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    # Step 1: Split by newlines first
+    lines = text.split('\n')
+    lines = [l.strip() for l in lines if l.strip()]
+
+    # Step 2: Split each line by sentence-end punctuation (.?!)
+    parts = []
+    for line in lines:
+        sents = re.split(r'(?<=[.?!。!?])\s+', line)
+        for s in sents:
+            s = s.strip()
+            if s:
+                parts.append(s)
+
+    # Step 3: Force-split parts that exceed max words
+    result = []
+    for part in parts:
+        words = part.split()
+        if len(words) <= _FORCE_FLUSH_MAX_WORDS:
+            result.append(part)
+        else:
+            # Split at max_words boundaries
+            for i in range(0, len(words), _FORCE_FLUSH_MAX_WORDS):
+                chunk = " ".join(words[i:i + _FORCE_FLUSH_MAX_WORDS])
+                if chunk:
+                    result.append(chunk)
+
+    # Step 4: Drop chunks that are only punctuation (no real words)
+    result = [c for c in result if re.search(r'\w', c)]
+    if not result:
+        return []
+
+    # Step 5: Merge chunks that are too short (1 word) with previous
+    if len(result) <= 1:
+        return result
+
+    merged = [result[0]]
+    for chunk in result[1:]:
+        if len(chunk.split()) < _MIN_FLUSH_WORDS and merged:
+            merged[-1] = merged[-1] + " " + chunk
+        else:
+            merged.append(chunk)
+
+    return merged if merged else [text]
 
 
 # Intent patterns for auto-tool injection
@@ -1158,12 +1617,14 @@ def _enrich_tool_args(name, args, state):
     return args
 
 
-def llm_generate_stream(user_text, conversation=None, session_state=None):
-    """Stream tokens from local Qwen model — with Agent tool-calling loop.
+def llm_generate_stream(user_text, conversation=None, session_state=None, cancel_event=None):
+    """Stream LLM tokens — routes to local Qwen or Groq API based on llm_mode.
 
-    If tools enabled: auto-inject tool data + run agent loop.
-    If tools disabled: stream directly (legacy).
+    Groq mode: tokens arrive via network → GPU free for TTS → true parallel pipeline.
+    Local mode: tokens from GPU → must serialize with TTS (single GPU contention).
     """
+    llm_mode = _ctx.get("llm_mode", "local")
+
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     # Inject session state as system context
@@ -1176,16 +1637,24 @@ def llm_generate_stream(user_text, conversation=None, session_state=None):
         messages.extend(conversation)
     messages.append({"role": "user", "content": user_text})
 
+    if llm_mode == "groq":
+        # Groq API — streaming agent with tool support
+        # Auto-inject tool results for faster response
+        if ENABLE_TOOLS:
+            _auto_inject_tools(user_text, messages)
+        yield from _groq_agent_step(messages, session_state=session_state, cancel_event=cancel_event)
+        return
+
+    # Local Qwen model
     if not ENABLE_TOOLS:
         yield from _llm_generate_once(messages, stream=True)
         return
 
     # Auto-inject tool results based on intent detection
-    auto_injected = _auto_inject_tools(user_text, messages)
+    _auto_inject_tools(user_text, messages)
 
-    # Agent loop — may take 1-3 rounds if tools are called
-    final_text = _agent_step(messages, session_state=session_state)
-    yield final_text
+    # Streaming agent — yields text chunks, handles tool calls inline
+    yield from _streaming_agent_step(messages, session_state=session_state, cancel_event=cancel_event)
 
 
 def llm_generate_api(user_text, conversation=None):
@@ -1394,11 +1863,11 @@ def handle_chat(audio_b64, conversation):
 
     # LLM + TTS
     try:
-        if llm_mode == "local" and llm_model is not None:
+        if llm_mode in ("local", "groq"):
             reply, wav_bytes, latency = chat_streaming_pipeline(transcript, conversation, session_state=session)
             llm_time = latency["llm"]
             tts_time = latency["tts"]
-            print(f"[LLM+TTS] Streaming: LLM {llm_time:.2f}s + TTS {tts_time:.2f}s | first_sentence {latency['first_sentence']:.2f}s")
+            print(f"[LLM+TTS] Streaming ({llm_mode}): LLM {llm_time:.2f}s + TTS {tts_time:.2f}s | first_sentence {latency['first_sentence']:.2f}s")
         else:
             t0 = time.time()
             reply = llm_generate_api(transcript, conversation)
@@ -1458,7 +1927,17 @@ def handle_chat(audio_b64, conversation):
 
 
 def handle_ws_process(ws, audio_bytes, conversation, cancel_event=None, turn_id=0):
-    """WebSocket handler: STT → streaming LLM → streaming TTS chunks."""
+    """WebSocket handler: serialized LLM↔TTS pipeline (no GPU contention).
+
+    Single-thread loop:
+      LLM streams tokens → detect sentence → PAUSE LLM → TTS synth → send audio → RESUME LLM
+
+    On 4090 single GPU, LLM and F5-TTS fight for CUDA. Serializing avoids jitter
+    and is actually faster than parallel (no contention stalls).
+
+    First chunk is kept very short (e.g. "Dạ, hiểu rồi.") so TTS finishes fast
+    and user hears response ASAP.
+    """
     import struct
     global _muted
     llm_mode = _ctx.get("llm_mode", "local")
@@ -1475,12 +1954,18 @@ def handle_ws_process(ws, audio_bytes, conversation, cancel_event=None, turn_id=
         if _is_cancelled():
             return
         obj["turn_id"] = turn_id
-        ws.send(json.dumps(obj))
+        try:
+            ws.send(json.dumps(obj))
+        except Exception:
+            cancel_event.set()
 
     def _send_audio(wav_bytes):
         if _is_cancelled():
             return
-        ws.send(turn_id_bytes + wav_bytes)
+        try:
+            ws.send(turn_id_bytes + wav_bytes)
+        except Exception:
+            cancel_event.set()
 
     # STT
     try:
@@ -1490,7 +1975,14 @@ def handle_ws_process(ws, audio_bytes, conversation, cancel_event=None, turn_id=
         print(f"[WS-STT] {stt_time:.2f}s: {transcript} | SNR={stt_metrics.get('input_snr_est', '?')}dB")
 
         if not transcript:
-            _send_json({"type": "error", "error": "Empty transcript"})
+            _send_json({"type": "ignored", "reason": "empty_transcript"})
+            return
+
+        # Skip very low SNR (likely just noise, not speech)
+        snr = stt_metrics.get("input_snr_est", 99)
+        if snr < 5 and len(transcript.split()) <= 2:
+            print(f"[WS-STT] Skipping low-SNR noise: SNR={snr}dB, transcript='{transcript}'")
+            _send_json({"type": "ignored", "reason": "low_snr_noise"})
             return
 
         _send_json({"type": "transcript", "text": transcript})
@@ -1518,64 +2010,141 @@ def handle_ws_process(ws, audio_bytes, conversation, cancel_event=None, turn_id=
         print(f"[WS] Turn {turn_id} cancelled after STT")
         return
 
-    # Backchannel: instantly send a filler clip ~30% of the time
+    # Backchannel: instantly send a filler clip
     backchannel_clips = _ctx.get("backchannel_clips", [])
     if backchannel_clips and random.random() < BACKCHANNEL_PROBABILITY:
         clip = random.choice(backchannel_clips)
         _send_audio(clip)
         print(f"[WS] Turn {turn_id} backchannel sent")
 
-    # LLM + TTS
+    # LLM + TTS pipeline
     try:
-        if llm_mode == "local" and llm_model is not None:
-            llm_t0 = time.time()
-            sentence_buffer = ""
-            full_response = ""
-            tts_time_total = 0.0
+        llm_t0 = time.time()
+        full_response = ""
+        tts_time_total = 0.0
+        _cancelled = False
+        first_audio_at = None
+        chunk_idx = 0
 
-            _cancelled = False
-            _first_audio_sent = False
-            for token in llm_generate_stream(transcript, conversation, session_state=session):
-                if _is_cancelled():
-                    print(f"[WS] Turn {turn_id} barge-in — stopping LLM")
-                    _cancelled = True
+        def _tts_and_send(sentence):
+            """TTS one sentence and send audio."""
+            nonlocal tts_time_total, first_audio_at, chunk_idx
+            if _muted or _is_cancelled() or not sentence:
+                return
+
+            tts_t0 = time.time()
+            print(f"[PIPE] Turn {turn_id} TTS chunk {chunk_idx}: '{sentence[:60]}'")
+            waveform = tts_synthesize(sentence)
+            tts_elapsed = time.time() - tts_t0
+            tts_time_total += tts_elapsed
+            print(f"[PIPE] Turn {turn_id} TTS chunk {chunk_idx} done: {tts_elapsed*1000:.0f}ms")
+
+            if waveform is not None and not _is_cancelled():
+                _send_audio(waveform_to_wav_bytes(waveform))
+                if first_audio_at is None:
+                    first_audio_at = time.time() - total_start
+                    print(f"[WS] Turn {turn_id} FIRST AUDIO at {first_audio_at*1000:.0f}ms (target <1500ms)")
+
+            chunk_idx += 1
+
+        if llm_mode == "groq":
+            # === GROQ: True parallel pipeline ===
+            # LLM tokens arrive via network (no GPU) → TTS runs on GPU simultaneously.
+            # _groq_agent_step yields sentences as they complete during streaming.
+            # We TTS each sentence immediately — Groq keeps streaming in parallel.
+            import queue as _queue
+
+            sentence_q = _queue.Queue()
+            llm_done = threading.Event()
+            llm_error = [None]
+
+            def _llm_worker():
+                """Collect sentences from Groq stream, push to queue."""
+                try:
+                    for text_chunk in llm_generate_stream(
+                        transcript, conversation,
+                        session_state=session, cancel_event=cancel_event
+                    ):
+                        if _is_cancelled():
+                            break
+                        chunk = text_chunk.strip()
+                        if chunk:
+                            sentence_q.put(chunk)
+                except Exception as e:
+                    llm_error[0] = e
+                    print(f"[GROQ-PIPE] LLM error: {e}")
+                finally:
+                    sentence_q.put(None)  # sentinel
+                    llm_done.set()
+
+            # Start LLM in background thread (network I/O only, no GPU)
+            llm_thread = threading.Thread(target=_llm_worker, daemon=True)
+            llm_thread.start()
+
+            # Main thread: consume sentences → TTS on GPU → send audio
+            while True:
+                try:
+                    sentence = sentence_q.get(timeout=30)
+                except _queue.Empty:
+                    print(f"[GROQ-PIPE] Timeout waiting for sentence")
                     break
-                sentence_buffer += token
-                full_response += token
 
-                # Flush TTS at sentence end only (. ? !)
-                # F5-TTS has ~1.7s fixed overhead per call, so fewer chunks = faster
-                should_flush = SENTENCE_END.search(sentence_buffer)
+                if sentence is None:  # sentinel
+                    break
+                if _is_cancelled():
+                    _cancelled = True
+                    print(f"[PIPE] Turn {turn_id} barge-in — stopping")
+                    break
 
-                if should_flush:
-                    sentence = sentence_buffer.strip()
-                    sentence_buffer = ""
-                    print(f"[LLM→TTS] Turn {turn_id} sentence: '{sentence}'")
+                full_response += sentence + " "
+                # For Groq, sentences already split by _groq_agent_step
+                # But might still need splitting if chunk is long
+                sentences = _split_sentences_for_tts(sentence)
+                for s in sentences:
+                    if _is_cancelled():
+                        break
+                    _tts_and_send(s)
 
-                    if not _muted:
-                        tts_t0 = time.time()
-                        waveform = tts_synthesize(sentence)
-                        tts_time_total += time.time() - tts_t0
-                        if waveform is not None:
-                            _send_audio(waveform_to_wav_bytes(waveform))
-                            if not _first_audio_sent:
-                                _first_audio_sent = True
-                                print(f"[WS] Turn {turn_id} first audio at {(time.time()-total_start)*1000:.0f}ms")
-
+            llm_thread.join(timeout=5)
+            if llm_error[0]:
+                raise llm_error[0]
+            reply = full_response.strip()
             llm_time = time.time() - llm_t0 - tts_time_total
 
-            if not _cancelled and sentence_buffer.strip() and not _muted:
-                tts_t0 = time.time()
-                waveform = tts_synthesize(sentence_buffer.strip())
-                tts_time_total += time.time() - tts_t0
-                if waveform is not None:
-                    _send_audio(waveform_to_wav_bytes(waveform))
+        elif llm_mode == "local" and llm_model is not None:
+            # === LOCAL: Serialized pipeline (single GPU contention) ===
+            # _streaming_agent_step collects ALL LLM tokens per round before yielding,
+            # so by the time we get text here, GPU is free for TTS.
+            for text_chunk in llm_generate_stream(
+                transcript, conversation,
+                session_state=session, cancel_event=cancel_event
+            ):
+                if _is_cancelled():
+                    _cancelled = True
+                    print(f"[PIPE] Turn {turn_id} barge-in — stopping")
+                    break
 
-            reply = full_response
+                chunk_stripped = text_chunk.strip()
+                if not chunk_stripped:
+                    continue
+
+                full_response += chunk_stripped + " "
+
+                sentences = _split_sentences_for_tts(chunk_stripped)
+                for sentence in sentences:
+                    if _is_cancelled():
+                        break
+                    _tts_and_send(sentence)
+
+            reply = full_response.strip()
+            llm_time = time.time() - llm_t0 - tts_time_total
+
         else:
+            # === API fallback (OpenAI) — no streaming ===
             t0 = time.time()
             reply = llm_generate_api(transcript, conversation)
             llm_time = time.time() - t0
+            tts_time_total = 0.0
 
             if _is_cancelled():
                 print(f"[WS] Turn {turn_id} cancelled after LLM API")
@@ -1595,18 +2164,20 @@ def handle_ws_process(ws, audio_bytes, conversation, cancel_event=None, turn_id=
         print(f"[SESSION] Turn {turn_id}: {session_summary}")
 
         total = time.time() - total_start
-        print(f"[WS] Turn {turn_id} | {total:.2f}s | STT {stt_time:.2f} + LLM {llm_time:.2f} + TTS {tts_time_total:.2f}")
+        first_audio_ms = (first_audio_at or 0) * 1000
+        print(f"[WS] Turn {turn_id} | {total:.2f}s | STT {stt_time:.2f} + LLM {llm_time:.2f} + TTS {tts_time_total:.2f} | first_audio {first_audio_ms:.0f}ms")
         print(f"  User: {transcript}")
         print(f"  Bot:  {reply[:80]}")
 
         log_metrics({
             **stt_metrics,
             "turn_id": turn_id,
-            "cancelled": _cancelled if llm_mode == "local" else False,
+            "cancelled": _cancelled,
             "stt_latency_ms": round(stt_time * 1000, 1),
             "llm_latency_ms": round(llm_time * 1000, 1),
             "tts_latency_ms": round(tts_time_total * 1000, 1),
             "total_latency_ms": round(total * 1000, 1),
+            "first_audio_ms": round(first_audio_ms, 1),
             "transcript": transcript,
             "response_len": len(reply),
             "channel": "websocket",
@@ -1622,6 +2193,7 @@ def handle_ws_process(ws, audio_bytes, conversation, cancel_event=None, turn_id=
                     "llm": round(llm_time, 2),
                     "tts": round(tts_time_total, 2),
                     "total": round(total, 2),
+                    "first_audio": round(first_audio_ms / 1000, 2),
                 },
                 "metrics": {
                     "input_snr": stt_metrics.get("input_snr_est"),
